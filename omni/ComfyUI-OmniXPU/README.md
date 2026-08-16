@@ -13,8 +13,32 @@ The runtime is deliberately split into three layers:
 No workflow or model-pipeline replacement is required.
 
 This repository is the standalone home of the custom node, extracted from
-[intel/llm-scaler](https://github.com/intel/llm-scaler). The node is also
+[intel/llm-scaler](https://github.com/intel/llm-scaler)
+(`omni/ComfyUI-OmniXPU`), with A770/DG2-specific additions. The node is also
 bundled with the `llm-scaler-omni` ComfyUI image.
+
+The official upstream README is preserved in
+[`UPSTREAM_README.md`](UPSTREAM_README.md); this file documents the fork.
+
+## Documentation layout
+
+| File | Content |
+|---|---|
+| `README.md` | This fork: install, switches, adapter behavior, A770 additions |
+| `UPSTREAM_README.md` | Official upstream README, preserved verbatim |
+
+## Fork changes vs upstream
+
+- Standalone custom-node install (clone into `custom_nodes/`, update with
+  `git pull`).
+- A770/DG2 compatibility profile: RMS-RoPE bridge, DG2 attention routing
+  (`esimd` opt-in plus measured torch fallbacks such as
+  `dg2_torch_d64_fp16`), ConvRot fused-path wiring, and INT8 fast paths with
+  cached qdata/scale copies.
+- Memory adapters: cached whole-LoRA model budgets (`lora_memory.py`) and
+  Windows DynamicVRAM boundary trim (`dynamic_vram.py`).
+- Windows attention policy defaults to `torch`; A770 users enable ESIMD with
+  `OMNI_ATTN_BACKEND=esimd`.
 
 ## Ownership
 
@@ -45,7 +69,8 @@ The node requires:
 - an `omni_xpu_kernel` wheel built for the active XPU target and Torch minor
   (prebuilt Windows wheels are published at
   <https://github.com/Blackwood416/omni-xpu-kernel/releases>; for A770 /
-  PyTorch 2.13 use `omni_xpu_kernel-0.2.0b1+torch213.dg2-cp313-cp313-win_amd64.whl`);
+  PyTorch 2.13 use the newest `0.2.0b1` wheel, currently build 1:
+  `omni_xpu_kernel-0.2.0b1+torch213.dg2.1-cp313-cp313-win_amd64.whl`);
 - the pinned `comfy_kitchen` XPU integration;
 - upstream ComfyUI.
 
