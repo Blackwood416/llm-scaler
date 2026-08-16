@@ -31,7 +31,7 @@ using sdp_kernel_fn = void (*)(void*, void*, void*, void*, void*, int, int,
 int main(int argc, char** argv) {
   const int L = argc > 1 ? std::atoi(argv[1]) : 20683;
   const int KV = argc > 2 ? std::atoi(argv[2]) : L;
-  const int H = argc > 4 ? std::atoi(argv[4]) : 56;
+  constexpr int H = 56;
   constexpr int D = 128;
   const int ITERS = argc > 3 ? std::atoi(argv[3]) : 16;
 
