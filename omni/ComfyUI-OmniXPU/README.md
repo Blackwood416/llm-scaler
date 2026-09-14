@@ -130,8 +130,8 @@ OMNIXPU_MEDIAN_STRICT_INDICES=1
 ```
 
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` reproduces the exact tie-break indices. The
-median workaround was only verified on BMG with Torch 2.10 and must not be
-enabled by default on PTL-H or another Torch version.
+median workaround was only verified on BMG with Torch 2.10 and remains
+disabled by default on other configurations.
 
 `OMNIXPU_INT8_DIRECT_CAST=1` is an A770-only experiment for partially
 offloaded INT8 models. ComfyUI's offload cast path can dequantize a
@@ -146,46 +146,6 @@ reuse the cached patched bf16 weight instead of recomputing the LoRA every
 step. This is separate (`OMNIXPU_INT8_PATCH_CACHE=1`) because early
 measurements showed it can regress under VRAM pressure; leave it off unless
 you are A/B testing that specific cache.
-
-## Adapter behavior
-
-Attention uses explicit capability guards. `auto` selects CUTE routes for
-matching platform, Torch-version, dtype, layout, and operator contracts, and
-uses the original PyTorch attention path for every remaining contract. It
-never selects ESIMD. `cute` and `esimd` are explicit diagnostic policies;
-unsupported contracts still fall back safely.
-
-On Windows, an unset `OMNI_ATTN_BACKEND` defaults to `torch`, leaving ComfyUI's
-PyTorch SDPA route unpatched. ESIMD remains available as an explicit diagnostic
-or performance opt-in with `OMNI_ATTN_BACKEND=esimd`; it is never selected
-automatically.
-
-On BMG with Torch 2.11, the experimental LTX-style BF16 D128 route accepts
-dense B2/H32 self-attention and B1/B2/H32 KV1024 cross-attention inputs as
-`[B,L,H*D]` tensors or dense BHLD views. The adapter makes the BHLD view
-without a layout copy. B2 self-attention uses CUTE from sequence length 768,
-and B1/B2 cross-attention uses it from query length 1024 when KV length is
-1024. There is no generation-size-derived upper limit: larger lengths are
-selected from the public kernel capability instead of an exact traced shape.
-
-The first use logs a warning with the global rollback setting. If the native
-operation raises for a contract, that call falls back to PyTorch and the
-contract is quarantined for the rest of the process. Set
-`OMNI_ATTN_BACKEND=torch` before ComfyUI startup to disable the experimental
-route globally.
-
-The norm adapter preserves ComfyUI cast/offload hooks and uses native kernels
-only for eligible tensors. PTL-H H120 and non-contiguous split-QKV routes also
-require native feature markers, preventing a stale wheel from taking them.
-
-The FP8 adapter is temporary ComfyUI integration around model/factory paths
-that are not completely expressed as Kitchen operations. Generic FP8 tensor
-quantization and dequantization remain Kitchen-owned.
-
-The fused INT8 FFN adapter wires eligible Lumina/Z-Image `FeedForward` blocks
-to Kitchen/native primitives. It does not register `comfy_kitchen::int8_linear`
-and does not replace a model pipeline. LoRA, offloaded weights, bias, training,
-unsupported layouts, and unsupported shapes retain ComfyUI's original route.
 
 ## Debugging and diagnostics
 
@@ -224,7 +184,6 @@ Kitchen backend ownership can be inspected independently:
 ```bash
 python -c 'import comfy_kitchen as ck; print(ck.list_backends()["xpu"])'
 ```
-
 The INT8 fast forward uses ComfyUI's `cast_bias_weight` / `uncast_bias_weight`
 pair, including Dynamic VRAM residency and low-VRAM LoRA patches. It avoids
 the redundant activation quantize/dequantize round trip, without keeping a
@@ -265,7 +224,7 @@ Measured end-to-end on A770 (`seedvr2_3b_int8_upscale_video.json`):
 the former `OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS` below 16 Mi did not
 speed up sampling. Those copy controls have since been removed.
 
-## Contribution boundary
+## What belongs upstream
 
 New device-generic math, layouts, quantization, or fallback logic belongs in
 `comfy_kitchen`. A custom-node adapter is appropriate only when a ComfyUI class
