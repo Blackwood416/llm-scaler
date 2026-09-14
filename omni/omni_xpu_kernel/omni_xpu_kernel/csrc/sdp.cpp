@@ -56,6 +56,8 @@ using sdp_kernel_fn = void (*)(
     int headKv,
     void* sycl_queue_ptr);
 
+using sdp_clear_fn = void (*)(void* sycl_queue_ptr);
+
 struct KernelLibrary {
 #ifdef _WIN32
     HMODULE handle{nullptr};
@@ -64,9 +66,12 @@ struct KernelLibrary {
 #endif
     sdp_kernel_fn fp16{nullptr};
     sdp_kernel_fn bf16io{nullptr};
+    sdp_kernel_fn fp16_bhld{nullptr};
+    sdp_kernel_fn bf16io_bhld{nullptr};
     sdp_kernel_fn fp16_fast{nullptr};   // no-clamp variant for small V
     sdp_kernel_fn fp16_hd64{nullptr};
     sdp_kernel_fn bf16io_hd64{nullptr};
+    sdp_clear_fn clear{nullptr};
 };
 
 KernelLibrary& get_kernel_library() {
@@ -130,9 +135,12 @@ KernelLibrary& get_kernel_library() {
 
         library.fp16 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16"));
         library.bf16io = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io"));
+        library.fp16_bhld = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_bhld"));
+        library.bf16io_bhld = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io_bhld"));
         library.fp16_fast = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_fast"));
         library.fp16_hd64 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_hd64"));
         library.bf16io_hd64 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io_hd64"));
+        library.clear = reinterpret_cast<sdp_clear_fn>(GetProcAddress(library.handle, "sdp_clear_cache"));
 #else
         Dl_info current_module_info;
         if (dladdr(reinterpret_cast<void*>(&get_kernel_library), &current_module_info) == 0 || current_module_info.dli_fname == nullptr) {
@@ -170,9 +178,12 @@ KernelLibrary& get_kernel_library() {
 
         library.fp16 = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16"));
         library.bf16io = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_bf16io"));
+        library.fp16_bhld = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16_bhld"));
+        library.bf16io_bhld = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_bf16io_bhld"));
         library.fp16_fast = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16_fast"));
         library.fp16_hd64 = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16_hd64"));
         library.bf16io_hd64 = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_bf16io_hd64"));
+        library.clear = reinterpret_cast<sdp_clear_fn>(dlsym(library.handle, "sdp_clear_cache"));
 #endif
 
         if (library.fp16 == nullptr || library.bf16io == nullptr) {
@@ -296,6 +307,10 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     int call_num = sdp_call_counter.fetch_add(1);
     bool needs_recheck = (call_num % RECHECK_INTERVAL == 0);
 
+    // DG2 fp32-accumulator kernels have enough headroom for any fp16 V value,
+    // so skip the V-scaling recheck entirely on that target. BMG/PTL-H keep
+    // the fp16-accumulator compensation path.
+#if !defined(OMNI_XPU_ARCH_DG2)
     if (needs_recheck) {
         float v_global_max = v.abs().max().item<float>();
         bool needs = (v_global_max >= V_SCALE_THRESHOLD);
@@ -319,6 +334,7 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
                        v_scale.max().item<float>());
         }
     }
+#endif
 
     bool needs_scaling = cached_needs_scaling.load();
 
@@ -369,7 +385,11 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
             const_cast<void*>(alpha_ptr),
             out.data_ptr(),
             static_cast<int>(q.size(1)),
+#if defined(OMNI_XPU_ARCH_DG2)
+            static_cast<int>(kv_len),
+#else
             static_cast<int>(kv_len + kv_pad),
+#endif
             static_cast<int>(q.size(2)),
             static_cast<int>(k.size(2)),
             &queue);
@@ -407,6 +427,80 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     }
 
     return out;
+}
+
+torch::Tensor sdp_bhld(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    // BHLD-direct entry: q/k/v are contiguous [B=1, H, L, D] (heads first).
+    // The DG2 sidecar reads them with BHLD addressing and writes the output
+    // in [B, L, H, D] (BLHD), so callers avoid three permute+copy passes.
+#if !defined(OMNI_XPU_ARCH_DG2)
+    TORCH_CHECK(false, "sdp_bhld: BHLD-direct entry is DG2-only on this build");
+#endif
+    for (auto* t : {&q, &k, &v}) {
+        TORCH_CHECK(t->device().type() == c10::DeviceType::XPU, "q/k/v must be on XPU");
+        TORCH_CHECK(t->is_contiguous(), "q/k/v must be contiguous [B, H, L, D]");
+        TORCH_CHECK(t->dim() == 4, "q/k/v must be 4-D [B, H, L, D]");
+        TORCH_CHECK(t->size(0) == 1, "batch size must be 1");
+        TORCH_CHECK(t->size(3) == 128, "BHLD-direct head_dim must be 128 (D64 not exposed)");
+        TORCH_CHECK(t->scalar_type() == ST::Half || t->scalar_type() == ST::BFloat16,
+                    "dtype must be FP16 or BF16");
+    }
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
+                "q, k, v must have the same dtype");
+    TORCH_CHECK(k.size(1) == v.size(1), "k and v must have the same head count");
+    TORCH_CHECK(q.size(2) == k.size(2) && k.size(2) == v.size(2), "k/v seq mismatch");
+    TORCH_CHECK(q.size(1) == k.size(1), "q/k head count mismatch");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "head_dim mismatch");
+
+    const int64_t H = q.size(1);
+    const int64_t q_len = q.size(2);
+    const int64_t kv_len = k.size(2);
+    // BHLD 路径不 pad K/V：DG2 v4 kernel 对越界行做 mask（作者在 A770 验证
+    // 过非 16 倍数长度行为正确）。BLHD 路径 pad 不影响 head stride，但 BHLD
+    // 下 pad 会改变每头 stride（(L+pad)*D vs L*D），kernel 按 L*D 寻址 →
+    // head>0 全部错位（作者审查指出的 blocking bug）。
+
+    auto& kernels = get_kernel_library();
+    // norm_alpha_cache(q) 对 BHLD 输入会读 q.size(2)（序列长）当 head 数，
+    // 键错但内容恒为全 1 所以无害——这里直接构造正确的 [H*D] 全 1。
+    auto norm_alpha = torch::ones({H * q.size(3)},
+                                  torch::dtype(torch::kFloat).device(q.device()));
+    const void* alpha_ptr = norm_alpha.data_ptr();
+    auto out = torch::empty({q.size(0), q_len, H, q.size(3)},
+                            torch::TensorOptions().dtype(q.scalar_type()).device(q.device()));
+    sycl::queue& queue = utils::get_queue(q.device());
+
+    auto call_bhld = [&](sdp_kernel_fn kernel) {
+        TORCH_CHECK(kernel != nullptr, "sdp_bhld: kernel not available for this configuration");
+        kernel(
+            q.data_ptr(), k.data_ptr(), v.data_ptr(), const_cast<void*>(alpha_ptr),
+            out.data_ptr(),
+            static_cast<int>(q_len),
+            static_cast<int>(kv_len),
+            static_cast<int>(H), static_cast<int>(H),
+            &queue);
+    };
+
+    switch (q.scalar_type()) {
+        case ST::Half:
+            call_bhld(kernels.fp16_bhld);
+            break;
+        case ST::BFloat16:
+            call_bhld(kernels.bf16io_bhld);
+            break;
+        default:
+            TORCH_CHECK(false, "sdp_bhld: unsupported dtype");
+    }
+    return out;
+}
+
+void clear_cache() {
+    auto& kernels = get_kernel_library();
+    if (kernels.clear == nullptr) {
+        return;
+    }
+    sycl::queue& queue = utils::get_queue(torch::Device(torch::kXPU, 0));
+    kernels.clear(&queue);
 }
 
 } // namespace sdp

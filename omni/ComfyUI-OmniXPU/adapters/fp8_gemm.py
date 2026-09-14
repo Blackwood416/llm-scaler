@@ -1,10 +1,11 @@
 """Patch comfy.ops fp8_linear and mixed_precision_ops to use
-omni_xpu_kernel's oneDNN W8A16 FP8 GEMM when running on XPU.
+omni_xpu_kernel's oneDNN W8A16 FP8 / INT8 GEMMs when running on XPU.
 
-Exactly mirrors the logic from comfyui_for_multi_arc.patch.
+ComfyUI retains ownership of weight casting, Dynamic VRAM and LoRA patches.
 """
 
 import logging
+import os
 
 import torch
 import comfy.model_management
@@ -15,7 +16,12 @@ from .errors import is_fatal_accelerator_error
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_fp8_linear = None
+_omni_int8 = None
 _logged_first_use = False
+_INT8_FAST_FORWARD = (
+    os.environ.get("OMNIXPU_INT8_FAST_FORWARD", "1").strip().lower()
+    not in ("", "0", "false", "no", "off")
+)
 
 
 def _log_first(msg):
@@ -36,6 +42,112 @@ def _dispatch_details(module):
     }
 
 
+def _int8_skip_reason(self, input, QuantizedTensor, TensorWiseINT8Layout):
+    """Return why the INT8 fast forward did not take this call (or None)."""
+    if not _INT8_FAST_FORWARD:
+        return "env_disabled"
+    if _omni_int8 is None:
+        return "omni_int8_unavailable"
+    if not input.is_xpu:
+        return "input_not_xpu"
+    if QuantizedTensor is None or TensorWiseINT8Layout is None:
+        return "int8_layout_unavailable"
+    if isinstance(input, QuantizedTensor):
+        return "quantized_input"
+    if input.requires_grad or comfy.model_management.in_training:
+        return "training"
+    if input.ndim < 2:
+        return "input_rank"
+    if len(self.weight_function):
+        return f"weight_function={len(self.weight_function)}"
+    if len(self.bias_function):
+        return f"bias_function={len(self.bias_function)}"
+    qf = getattr(self, "quant_format", None)
+    if qf != "int8_tensorwise":
+        return f"quant_format={qf!r}"
+    if getattr(self, "_full_precision_mm", False):
+        return "full_precision_mm"
+    if getattr(self, "comfy_force_cast_weights", False):
+        return "comfy_force_cast_weights"
+    if getattr(self, "pre_quant_scale", None) is not None:
+        return "pre_quant_scale_set"
+    if getattr(self, "input_scale", None) is not None:
+        return "input_scale_set"
+    w = self.weight
+    if not isinstance(w, QuantizedTensor):
+        return f"weight_type={type(w).__name__}"
+    if getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
+        return f"layout={getattr(w, '_layout_cls', None)!r}"
+    if getattr(w._params, "transposed", False):
+        return "transposed_weight"
+    return None
+
+
+_int8_skip_logged = set()
+
+
+def _log_int8_skip(reason):
+    if reason is None or reason in _int8_skip_logged:
+        return
+    if len(_int8_skip_logged) >= 10:
+        return
+    _int8_skip_logged.add(reason)
+    log.info("[OmniXPU] int8 fast path skipped: %s", reason)
+
+
+def _int8_forward_cast(comfy_ops, linear, x, QuantizedTensor,
+                       TensorWiseINT8Layout, input_act=None):
+    """Use Comfy's current patched weight for the entire kernel submission.
+
+    A dynamic-VRAM module's ``weight`` remains on CPU. Only cast_bias_weight
+    can fault/pin its current VBAR pages and apply low-VRAM LoRA patches.
+    Never cache the returned views beyond uncast: their addresses can be
+    reused after eviction even while the Python tensors are still alive.
+    """
+    weight, bias, offload_stream = comfy_ops.cast_bias_weight(
+        linear, x, offloadable=True, compute_dtype=x.dtype, want_requant=True,
+    )
+    try:
+        quantized = (
+            isinstance(weight, QuantizedTensor)
+            and getattr(weight, "_layout_cls", None) == "TensorWiseINT8Layout"
+            and not getattr(weight._params, "transposed", False)
+        )
+        if quantized:
+            qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+            params = weight._params
+            input_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+            try:
+                out = _omni_int8.int8_linear(
+                    input_2d, qdata.contiguous(), scale, bias,
+                    out_dtype=x.dtype,
+                    convrot=bool(getattr(params, "convrot", False)),
+                    convrot_groupsize=int(getattr(params, "convrot_groupsize", 256)),
+                    input_act=input_act,
+                )
+                if out is not None:
+                    log_debug_event(
+                        "kernel", "int8_linear",
+                        {"x": input_2d, "weight": qdata,
+                         "weight_scale": scale, "bias": bias},
+                        details={"backend": "omni_int8_cast", "input_act": input_act},
+                    )
+                    return out.reshape(*x.shape[:-1], out.shape[-1])
+            except Exception as error:
+                if is_fatal_accelerator_error(error):
+                    raise
+                _log_first(f"int8 kernel failed, using cast weight: {error}")
+
+        # A dtype conversion may return a dense weight. On kernel fallback
+        # reuse the cast result too; re-entering forward could reapply a LoRA
+        # or release the VBAR lease before this submission has finished.
+        dense_weight = weight.dequantize() if isinstance(weight, QuantizedTensor) else weight
+        activated = comfy_ops.INPUT_ACT_EAGER[input_act](x) if input_act else x
+        return torch.nn.functional.linear(activated, dense_weight, bias)
+    finally:
+        comfy_ops.uncast_bias_weight(linear, weight, bias, offload_stream)
+
+
 def _prepare_scale(scale, weight, input):
     scale = torch.as_tensor(scale, device=input.device, dtype=torch.float32).reshape(-1)
     if scale.numel() == 1:
@@ -44,12 +156,17 @@ def _prepare_scale(scale, weight, input):
 
 
 def apply():
-    global _omni_fp8_linear
+    global _omni_fp8_linear, _omni_int8
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.linear_fp8 is None:
         return False, "omni_xpu_kernel linear_fp8 not available"
     _omni_fp8_linear = probe.linear_fp8
+    _omni_int8 = probe.int8
+    log.info(
+        "[OmniXPU] int8 fast forward: %s (Comfy cast with Dynamic VRAM/LoRA)",
+        "enabled" if _INT8_FAST_FORWARD else "disabled (OMNIXPU_INT8_FAST_FORWARD=0)",
+    )
 
     import comfy.ops as comfy_ops
 
@@ -116,6 +233,7 @@ def apply():
     if hasattr(comfy_ops, "mixed_precision_ops"):
         _orig_mixed = comfy_ops.mixed_precision_ops
         QuantizedTensor = getattr(comfy_ops, "QuantizedTensor", None)
+        TensorWiseINT8Layout = getattr(comfy_ops, "TensorWiseINT8Layout", None)
 
         def _patched_mixed(*args, **kwargs):
             klass = _orig_mixed(*args, **kwargs)
@@ -162,6 +280,19 @@ def apply():
                     details=_dispatch_details(self),
                     verbose_only=True,
                 )
+                # Skip only the redundant activation quantize/dequantize;
+                # Comfy still owns weight paging, LoRA and stream retirement.
+                reason = _int8_skip_reason(
+                    self, input, QuantizedTensor, TensorWiseINT8Layout,
+                )
+                if reason is None:
+                    comfy_ops.run_every_op()
+                    return _int8_forward_cast(
+                        comfy_ops, self, input, QuantizedTensor,
+                        TensorWiseINT8Layout,
+                    )
+                _log_int8_skip(reason)
+
                 if (_omni_fp8_linear is not None and input.is_xpu and
                         getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
                         len(self.weight_function) == 0 and len(self.bias_function) == 0):
@@ -211,5 +342,20 @@ def apply():
             return klass
 
         comfy_ops.mixed_precision_ops = _patched_mixed
+
+        # -- Intercept 3: linear_input_act (SwiGLU + down projection) --
+        _orig_linear_input_act = comfy_ops.linear_input_act
+
+        def _patched_linear_input_act(linear, x, input_act):
+            if input_act == "swiglu" and _int8_skip_reason(
+                linear, x, QuantizedTensor, TensorWiseINT8Layout,
+            ) is None:
+                return _int8_forward_cast(
+                    comfy_ops, linear, x, QuantizedTensor,
+                    TensorWiseINT8Layout, input_act=input_act,
+                )
+            return _orig_linear_input_act(linear, x, input_act)
+
+        comfy_ops.linear_input_act = _patched_linear_input_act
 
     return True, None

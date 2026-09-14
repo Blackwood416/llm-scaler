@@ -1,6 +1,9 @@
 """SVDQuant W4A4 Kernels - Intel XPU ESIMD + oneDNN optimized."""
 
 import torch
+
+from .. import _compile_meta as _meta
+from .._compile_ops import compile_op
 from typing import Tuple
 
 
@@ -10,6 +13,7 @@ def _get_native():
     return _load_extension().svdq
 
 
+@compile_op("svdq_dequantize_w4", _meta.svdq_dequantize)
 def dequantize_w4(
     packed: torch.Tensor,
     scales: torch.Tensor,
@@ -26,17 +30,23 @@ def dequantize_w4(
     Returns:
         [N, K] dequantized tensor in out_dtype
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_dequantize_w4(packed, scales, out_dtype)
     return _get_native().dequantize_svdq_w4(packed, scales, out_dtype)
 
 
+@compile_op("svdq_dequantize_u4", _meta.svdq_dequantize)
 def dequantize_u4(
     packed: torch.Tensor,
     scales: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_dequantize_u4(packed, scales, out_dtype)
     return _get_native().dequantize_svdq_u4(packed, scales, out_dtype)
 
 
+@compile_op("svdq_unpack_int4", _meta.svdq_unpack)
 def unpack_int4(
     packed: torch.Tensor,
     signed: bool = True,
@@ -51,9 +61,12 @@ def unpack_int4(
     Returns:
         [M, K] int8 tensor
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_unpack_int4(packed, signed)
     return _get_native().unpack_svdq_int4(packed, signed)
 
 
+@compile_op("svdq_quantize_act_int4", _meta.svdq_quantize)
 def quantize_act_int4(
     input: torch.Tensor,
     group_size: int = 64,
@@ -68,16 +81,22 @@ def quantize_act_int4(
     Returns:
         (packed [M, K/2] uint8, scales [num_groups, M])
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_quantize_act_int4(input, group_size)
     return _get_native().quantize_svdq_act_int4(input, group_size)
 
 
+@compile_op("svdq_quantize_act_uint4", _meta.svdq_quantize)
 def quantize_act_uint4(
     input: torch.Tensor,
     group_size: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_quantize_act_uint4(input, group_size)
     return _get_native().quantize_svdq_act_uint4(input, group_size)
 
 
+@compile_op("svdq_onednn_int4_gemm", _meta.svdq_gemm)
 def onednn_int4_gemm(
     act: torch.Tensor,
     packed: torch.Tensor,
@@ -98,9 +117,12 @@ def onednn_int4_gemm(
     Returns:
         [M, N] same dtype as act
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_onednn_int4_gemm(act, packed, wscales)
     return _get_native().onednn_int4_gemm(act, packed, wscales)
 
 
+@compile_op("svdq_onednn_int4_gemm_preconverted", _meta.svdq_gemm)
 def onednn_int4_gemm_preconverted(
     act: torch.Tensor,
     packed_u4: torch.Tensor,
@@ -122,9 +144,36 @@ def onednn_int4_gemm_preconverted(
     Returns:
         [M, N] same dtype as act
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_onednn_int4_gemm_preconverted(act, packed_u4, scales_f16)
     return _get_native().onednn_int4_gemm_preconverted(act, packed_u4, scales_f16)
 
 
+def onednn_int4_gemm_torchao(
+    act: torch.Tensor,
+    packed_u4: torch.Tensor,
+    zp_u8: torch.Tensor,
+    scales_f16: torch.Tensor,
+) -> torch.Tensor:
+    """
+    torchao-format INT4 native (asymmetric): unsigned u4 weights + per-block
+    zero points + per-block f16 scales. w = (q - zp) * scale inside oneDNN —
+    no conversion, no correction. Asymmetric per-block zero point reduces
+    quantization error on biased weight distributions.
+
+    Args:
+        act: [M, K] bf16/f16/f32 activations
+        packed_u4: [N, K/2] uint8 — RAW qdata byte view (unsigned nibbles, NO xor)
+        zp_u8: [num_groups, N] uint8 — per-block zero points
+        scales_f16: [num_groups, N] f16 — per-block weight scales
+
+    Returns:
+        [M, N] same dtype as act
+    """
+    return _get_native().onednn_int4_gemm_torchao(act, packed_u4, zp_u8, scales_f16)
+
+
+@compile_op("svdq_onednn_int4_gemm_add_to_output", _meta.void, mutates_args=("dst",))
 def onednn_int4_gemm_add_to_output(
     act: torch.Tensor,
     packed_u4: torch.Tensor,
@@ -143,9 +192,12 @@ def onednn_int4_gemm_add_to_output(
         scales_f16: [num_groups, N] f16 — weight scales
         dst: [M, N] bf16 output tensor (modified in-place: dst += GEMM result)
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_onednn_int4_gemm_add_to_output(act, packed_u4, scales_f16, dst)
     _get_native().onednn_int4_gemm_add_to_output(act, packed_u4, scales_f16, dst)
 
 
+@compile_op("svdq_fused_convert_add", _meta.void, mutates_args=("out",))
 def fused_convert_add(
     out: torch.Tensor,
     result: torch.Tensor,
@@ -162,9 +214,12 @@ def fused_convert_add(
         result: [Mr, Nr] f16 GEMM result (may be larger than out)
         residual: [Mo, No] bf16 residual to add
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_fused_convert_add(out, result, residual)
     _get_native().fused_convert_add(out, result, residual)
 
 
+@compile_op("svdq_fused_smooth_convert", _meta.svdq_smooth)
 def fused_smooth_convert(
     x: torch.Tensor,
     smooth_factor: torch.Tensor,
@@ -179,9 +234,12 @@ def fused_smooth_convert(
     Returns:
         [M, K] f16 = (x / smooth_factor).to(f16)
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_fused_smooth_convert(x, smooth_factor)
     return _get_native().fused_smooth_convert(x, smooth_factor)
 
 
+@compile_op("svdq_fused_smooth_mul_convert", _meta.svdq_smooth)
 def fused_smooth_mul_convert(
     x: torch.Tensor,
     rcp_smooth: torch.Tensor,
@@ -198,6 +256,8 @@ def fused_smooth_mul_convert(
     Returns:
         [M, K] f16 = (x * rcp_smooth)
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_fused_smooth_mul_convert(x, rcp_smooth)
     return _get_native().fused_smooth_mul_convert(x, rcp_smooth)
 
 
@@ -222,6 +282,39 @@ def prepare_onednn_weights(
     scales_f16 = wscales.to(torch.float16).contiguous()
     return packed_u4, scales_f16
 
+@compile_op("svdq_quantize_act_s8", _meta.svdq_quantize_act_s8)
+def quantize_act_s8(
+    input: torch.Tensor,
+    group_size: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-group symmetric s8 activation quantization for W4A8.
+
+    Args:
+        input: [M, K] fp16/bf16 activation tensor.
+        group_size: quantization group size (32 or 64).
+
+    Returns:
+        (act_s8 [M, K] int8, scales [M, num_groups] f32)
+    """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.svdq_quantize_act_s8(input, group_size)
+    return _get_native().quantize_svdq_act_s8(input, group_size)
+
+
+def onednn_s8u4_gemm(
+    act: torch.Tensor,
+    xscales: torch.Tensor,
+    packed_u4: torch.Tensor,
+    scales_f16: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    zp_u8: torch.Tensor | None = None,
+) -> torch.Tensor:
+    out = _get_native().onednn_s8u4_gemm(
+        act, xscales, packed_u4, scales_f16, out_dtype, zp_u8
+    )
+    # native returns f32 (wide accumulator); cast to the model dtype here.
+    return out.to(out_dtype)
+
 
 __all__ = [
     "dequantize_w4",
@@ -229,10 +322,13 @@ __all__ = [
     "unpack_int4",
     "quantize_act_int4",
     "quantize_act_uint4",
+    "quantize_act_s8",
     "onednn_int4_gemm",
     "onednn_int4_gemm_preconverted",
+    "onednn_int4_gemm_torchao",
     "onednn_int4_gemm_add_to_output",
     "prepare_onednn_weights",
+    "onednn_s8u4_gemm",
     "fused_convert_add",
     "fused_smooth_convert",
     "fused_smooth_mul_convert",

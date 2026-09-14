@@ -41,6 +41,13 @@ from typing import Optional, Tuple
 
 import torch
 
+from .. import _compile_meta as _meta
+from .._compile_ops import (
+    compile_op, fake_rowwise, fake_silu_mul, fake_silu_mul_rowwise,
+    fake_swiglu_rowwise, fake_gelu_rowwise, fake_int8_linear,
+    fake_prequantized, fake_shared_input, fake_rotate_convrot,
+)
+
 from ._reference import (
     quantize_int8_tensorwise as _ref_quantize_int8_tensorwise,
     quantize_int8_rowwise as _ref_quantize_int8_rowwise,
@@ -87,6 +94,128 @@ def _apply_input_act(
 _h3_swiglu_trace_logged = False
 _h3_low_peak_trace_logged = False
 _h3_low_peak_convrot_trace_logged = False
+_dg2_convrot_fused_trace_logged = False
+_int8_linear_tiling_trace_logged = False
+
+# A single very-large dynamic INT8 matmul keeps its full MxK quantized
+# activation live beside the unavoidable MxN output.  Under resident model
+# weights this can exhaust device memory or Level Zero resources.  Bound each
+# dispatch by its quantized-input plus output span; rowwise quantization makes
+# rows independent, so tiling preserves the quantization and output contracts.
+_INT8_LINEAR_TILING_MIN_QUANTIZED_BYTES = 512 * 1024**2
+_INT8_LINEAR_TILING_MIN_LIVE_BYTES = 2 * 1024**3
+_INT8_LINEAR_TILING_CHUNK_BYTES = 512 * 1024**2
+_INT8_LINEAR_TILING_ROW_ALIGNMENT = 4096
+
+
+def _int8_linear_chunk_rows(
+    input_features: int, output_features: int, element_size: int
+) -> int:
+    """Return a row tile from the operator's per-row live-byte contract."""
+    row_bytes = input_features + 4 + output_features * element_size
+    rows = max(1, _INT8_LINEAR_TILING_CHUNK_BYTES // row_bytes)
+    if rows >= _INT8_LINEAR_TILING_ROW_ALIGNMENT:
+        rows = (
+            rows // _INT8_LINEAR_TILING_ROW_ALIGNMENT
+            * _INT8_LINEAR_TILING_ROW_ALIGNMENT
+        )
+    return rows
+
+
+def _can_tile_int8_linear(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> bool:
+    """Select bounded row tiling from the operator contract, not model identity."""
+    if (
+        native is None
+        or not hasattr(native, "quantize_int8_rowwise_fused")
+        or not hasattr(native, "int8_linear_prequantized_out")
+        or not isinstance(x, torch.Tensor)
+        or x.device.type != "xpu"
+        or x.dtype not in (torch.float16, torch.bfloat16)
+        or x.ndim < 1
+        or x.shape[-1] <= 0
+        or x.requires_grad
+        or not isinstance(weight, torch.Tensor)
+        or weight.ndim != 2
+        or weight.shape[0] <= 0
+        or weight.shape[1] != x.shape[-1]
+        or weight.device != x.device
+        or weight.dtype != torch.int8
+        or out_dtype not in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        return False
+    element_size = 4 if out_dtype == torch.float32 else 2
+    rows = x.numel() // x.shape[-1]
+    chunk_rows = _int8_linear_chunk_rows(
+        x.shape[-1], weight.shape[0], element_size
+    )
+    quantized_activation_bytes = rows * (x.shape[-1] + 4)
+    output_bytes = rows * weight.shape[0] * element_size
+    return bool(
+        rows > chunk_rows
+        and quantized_activation_bytes
+        >= _INT8_LINEAR_TILING_MIN_QUANTIZED_BYTES
+        and quantized_activation_bytes + output_bytes
+        >= _INT8_LINEAR_TILING_MIN_LIVE_BYTES
+    )
+
+
+def _tile_int8_linear(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    dtype_code: int,
+) -> torch.Tensor:
+    """Quantize and project independent row tiles into one final output."""
+    global _int8_linear_tiling_trace_logged
+
+    input_shape = tuple(x.shape)
+    rows = x.numel() // x.shape[-1]
+    output_features = weight.shape[0]
+    element_size = 4 if out_dtype == torch.float32 else 2
+    chunk_rows = _int8_linear_chunk_rows(
+        x.shape[-1], output_features, element_size
+    )
+    x_2d = x.reshape(rows, x.shape[-1])
+    output_2d = torch.empty(
+        (rows, output_features), device=x.device, dtype=out_dtype
+    )
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        chunk = x_2d[start:stop].contiguous()
+        x_int8, x_scale = native.quantize_int8_rowwise_fused(chunk)
+        output_chunk = output_2d[start:stop]
+        native.int8_linear_prequantized_out(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias,
+            dtype_code,
+            output_chunk,
+        )
+        del output_chunk, x_scale, x_int8, chunk
+
+    if (
+        not _int8_linear_tiling_trace_logged
+        and os.environ.get("OMNIXPU_INT8_TILING_TRACE") == "1"
+    ):
+        print(
+            "[OmniXPU] bounded int8_linear: "
+            f"input={input_shape} output_features={output_features} "
+            f"chunk_rows={chunk_rows}",
+            flush=True,
+        )
+        _int8_linear_tiling_trace_logged = True
+
+    return output_2d.reshape(*input_shape[:-1], output_features)
 
 # The failing 720-class/15s allocation is a single 2.671 GiB BF16 H3 SwiGLU
 # output.  Keep established shorter sequences on the faster whole-tensor route
@@ -112,6 +241,26 @@ def _is_supported_h3_swiglu_target() -> bool:
         return False
 
 
+def _is_supported_h3_swiglu_input(x, weight) -> bool:
+    if _is_supported_h3_swiglu_target():
+        return True
+    try:
+        from .. import __xpu_target__, core_aot_target
+
+        # A770, Torch 2.14, driver 32.0.101.8860: the existing strided BF16
+        # kernel was bit-exact on the 0.4 MP / 124-frame H3 activation and
+        # measured 3.33 ms versus 5.43 ms for eager SiLU + in-place multiply.
+        # Keep the BMG low-peak/tiling policies and unmeasured DG2 shapes gated.
+        return (
+            __xpu_target__ == "dg2"
+            and core_aot_target() == "dg2"
+            and tuple(getattr(x, "shape", ())) == (16473, 28672)
+            and tuple(getattr(weight, "shape", ())) == (5376, 14336)
+        )
+    except (ImportError, RuntimeError):
+        return False
+
+
 def _can_fuse_h3_swiglu(
     x: torch.Tensor,
     native,
@@ -125,7 +274,7 @@ def _can_fuse_h3_swiglu(
         input_act == "swiglu"
         and convrot
         and convrot_groupsize == 256
-        and _is_supported_h3_swiglu_target()
+        and _is_supported_h3_swiglu_input(x, weight)
         and native is not None
         and hasattr(native, "fused_silu_mul_exact_bf16")
         and isinstance(x, torch.Tensor)
@@ -144,6 +293,78 @@ def _can_fuse_h3_swiglu(
         and weight.ndim == 2
         and weight.shape[1] == x.shape[1] // 2
     )
+
+
+def _can_use_dg2_convrot_fused(
+    x: torch.Tensor,
+    native,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> bool:
+    """Return whether the DG2 fused ConvRot+quantize route applies.
+
+    The A770 wheel exposes ``quantize_int8_convrot_fused_dg2``: a radix-4
+    SLM butterfly fused with rowwise INT8 quantization (K <= 14336). It is
+    target-gated to DG2 until the same kernel is measured on other GPUs.
+    """
+    if (
+        native is None
+        or not (
+            hasattr(native, "quantize_int8_convrot_fused_esimd")
+            or hasattr(native, "quantize_int8_convrot_fused_dg2")
+        )
+        or not convrot
+        or convrot_groupsize not in (64, 256)
+        or not isinstance(x, torch.Tensor)
+        or x.device.type != "xpu"
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.ndim != 2
+        or x.shape[0] <= 0
+        or x.shape[1] <= 0
+        or x.shape[1] > 16384
+        or x.shape[1] % convrot_groupsize != 0
+        or not x.is_contiguous()
+        or x.requires_grad
+    ):
+        return False
+    try:
+        from .. import __xpu_target__
+
+        if __xpu_target__ != "dg2":
+            return False
+    except (ImportError, RuntimeError):
+        return False
+    # Enabled by default on A770; set =0 for a composed-path A/B.
+    return os.environ.get("OMNIXPU_DG2_CONVROT_FUSED", "1") != "0"
+
+
+def _apply_dg2_convrot_fused(
+    x: torch.Tensor,
+    native,
+    convrot_groupsize: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fused DG2 ConvRot+quantize path and log its first use."""
+    global _dg2_convrot_fused_trace_logged
+
+    if hasattr(native, "quantize_int8_convrot_fused_esimd"):
+        result = native.quantize_int8_convrot_fused_esimd(
+            x, convrot_groupsize
+        )
+    else:
+        result = native.quantize_int8_convrot_fused_dg2(
+            x, convrot_groupsize
+        )
+    if (
+        not _dg2_convrot_fused_trace_logged
+        and os.environ.get("OMNIXPU_H3_SWIGLU_TRACE") == "1"
+    ):
+        print(
+            "[OmniXPU] DG2 fused ConvRot+quantize route: "
+            f"input={tuple(x.shape)} group={convrot_groupsize}",
+            flush=True,
+        )
+        _dg2_convrot_fused_trace_logged = True
+    return result
 
 
 def _apply_h3_swiglu_exact(x: torch.Tensor, native) -> torch.Tensor:
@@ -230,8 +451,15 @@ def _stream_h3_swiglu_int8_linear(
         chunk = x[start:stop]
         gate, up = chunk.chunk(2, dim=-1)
         activated = native.fused_silu_mul_exact_bf16(gate, up)
-        rotated = native.rotate_convrot(activated, 256)
-        x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
+        if _can_use_dg2_convrot_fused(
+            activated, native, True, 256
+        ):
+            x_int8, x_scale = _apply_dg2_convrot_fused(
+                activated, native, 256
+            )
+        else:
+            rotated = native.rotate_convrot(activated, 256)
+            x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
         output_chunk = output[start:stop]
         native.int8_linear_prequantized_out(
             x_int8,
@@ -244,16 +472,7 @@ def _stream_h3_swiglu_int8_linear(
         )
         # Do not retain the previous chunk while launching the next producer.
         # PyTorch's XPU allocator records stream use before recycling storage.
-        del (
-            output_chunk,
-            x_scale,
-            x_int8,
-            rotated,
-            activated,
-            up,
-            gate,
-            chunk,
-        )
+        del output_chunk, x_scale, x_int8, activated, up, gate, chunk
 
     if (
         not _h3_low_peak_trace_logged
@@ -328,8 +547,11 @@ def _stream_h3_convrot_int8_linear(
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         chunk = x[start:stop]
-        rotated = native.rotate_convrot(chunk, 256)
-        x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
+        if _can_use_dg2_convrot_fused(chunk, native, True, 256):
+            x_int8, x_scale = _apply_dg2_convrot_fused(chunk, native, 256)
+        else:
+            rotated = native.rotate_convrot(chunk, 256)
+            x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
         output_chunk = output[start:stop]
         native.int8_linear_prequantized_out(
             x_int8,
@@ -340,7 +562,7 @@ def _stream_h3_convrot_int8_linear(
             dtype_code,
             output_chunk,
         )
-        del output_chunk, x_scale, x_int8, rotated, chunk
+        del output_chunk, x_scale, x_int8, chunk
 
     if (
         not _h3_low_peak_convrot_trace_logged
@@ -664,6 +886,37 @@ def _quantize_krea2_int8_convrot(
 # =============================================================================
 
 
+@compile_op("quantize_int8_tensorwise", _meta.tensorwise)
+def _quantize_tensorwise(
+    x: torch.Tensor, stochastic_rounding: int = 0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compile-side entry point: no pre-computed scale (upstream contract)."""
+    native = _get_native()
+    if native is not None and hasattr(native, "quantize_int8_tensorwise"):
+        return native.quantize_int8_tensorwise(x, None, stochastic_rounding)
+    return _ref_quantize_int8_tensorwise(x, None, stochastic_rounding)
+
+
+@compile_op("quantize_int8_tensorwise_scaled", _meta.tensorwise_scaled)
+def _quantize_tensorwise_scaled(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    stochastic_rounding: int = 0,
+) -> torch.Tensor:
+    """Compile-side entry point with a caller-provided scale.
+
+    Returns only the quantized tensor: the public wrapper keeps ownership of the
+    FP32 output scale so the custom op never aliases its own input.
+    """
+    native = _get_native()
+    if native is not None and hasattr(native, "quantize_int8_tensorwise"):
+        quantized, _ = native.quantize_int8_tensorwise(
+            x, scale, stochastic_rounding
+        )
+        return quantized
+    return _ref_quantize_int8_tensorwise(x, scale, stochastic_rounding)[0]
+
+
 def quantize_int8_tensorwise(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
@@ -681,12 +934,29 @@ def quantize_int8_tensorwise(
             - quantized_int8: INT8 tensor with same shape
             - scale: Scalar float32 tensor
     """
+    if torch.compiler.is_compiling():
+        if scale is None:
+            return torch.ops.omni_xpu.quantize_int8_tensorwise(
+                x, stochastic_rounding
+            )
+        output_scale = scale.to(device=x.device, dtype=torch.float32)
+        if stochastic_rounding <= 0 and x.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            output_scale = output_scale.contiguous()
+        quantized = torch.ops.omni_xpu.quantize_int8_tensorwise_scaled(
+            x, output_scale, stochastic_rounding
+        )
+        return quantized, output_scale
     native = _get_native()
     if native is not None and hasattr(native, "quantize_int8_tensorwise"):
         return native.quantize_int8_tensorwise(x, scale, stochastic_rounding)
     return _ref_quantize_int8_tensorwise(x, scale, stochastic_rounding)
 
 
+@compile_op("quantize_int8_rowwise", fake_rowwise)
 def quantize_int8_rowwise(
     x: torch.Tensor,
     stochastic_rounding: int = 0,
@@ -702,6 +972,8 @@ def quantize_int8_rowwise(
             - quantized_int8: INT8 tensor with same shape
             - scales: Float32 tensor [..., 1] with per-row scales
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.quantize_int8_rowwise(x, stochastic_rounding)
     native = _get_native()
     if native is not None:
         # The fused hot path covers deterministic FP32/FP16/BF16 rowwise input.
@@ -718,6 +990,7 @@ def quantize_int8_rowwise(
     return _ref_quantize_int8_rowwise(x, stochastic_rounding)
 
 
+@compile_op("fused_silu_mul_quantize_rowwise", fake_silu_mul_rowwise)
 def fused_silu_mul_quantize_rowwise(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -728,16 +1001,21 @@ def fused_silu_mul_quantize_rowwise(
     returned quantized tensor and row scales can be passed directly to
     :func:`int8_linear_prequantized`.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_silu_mul_quantize_rowwise(x1, x2)
     native = _get_native()
     if native is not None and hasattr(native, "fused_silu_mul_quantize_rowwise"):
         return native.fused_silu_mul_quantize_rowwise(x1, x2)
     return _ref_fused_silu_mul_quantize_rowwise(x1, x2)
 
 
+@compile_op("fused_swiglu_quantize_rowwise", fake_swiglu_rowwise)
 def fused_swiglu_quantize_rowwise(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse concatenated ``[gate | up]`` SwiGLU with rowwise INT8 quantization."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_swiglu_quantize_rowwise(input)
     if input.shape[-1] <= 0 or input.shape[-1] % 2:
         raise ValueError("SwiGLU input last dimension must be positive and even")
     native = _get_native()
@@ -747,10 +1025,13 @@ def fused_swiglu_quantize_rowwise(
     return _ref_fused_silu_mul_quantize_rowwise(gate, up)
 
 
+@compile_op("fused_gelu_tanh_quantize_rowwise", fake_gelu_rowwise)
 def fused_gelu_tanh_quantize_rowwise(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse tanh-approximate GELU with rowwise INT8 quantization."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_gelu_tanh_quantize_rowwise(input)
     if input.shape[-1] <= 0:
         raise ValueError("GELU input last dimension must be positive")
     native = _get_native()
@@ -760,6 +1041,7 @@ def fused_gelu_tanh_quantize_rowwise(
     return quantize_int8_rowwise(activated)
 
 
+@compile_op("fused_silu_mul", fake_silu_mul)
 def fused_silu_mul(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -770,12 +1052,15 @@ def fused_silu_mul(
     ConvRot: it removes the separate SiLU allocation while preserving the
     existing optimized transform implementation.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_silu_mul(x1, x2)
     native = _get_native()
     if native is not None and hasattr(native, "fused_silu_mul"):
         return native.fused_silu_mul(x1, x2)
     return _ref_fused_silu_mul(x1, x2)
 
 
+@compile_op("dequantize_int8_simple", _meta.int8_dequantize)
 def dequantize_int8_simple(
     q: torch.Tensor,
     scale: torch.Tensor,
@@ -789,12 +1074,15 @@ def dequantize_int8_simple(
     Returns:
         Dequantized float32 tensor.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.dequantize_int8_simple(q, scale)
     native = _get_native()
     if native is not None and hasattr(native, "dequantize_int8_simple"):
         return native.dequantize_int8_simple(q, scale)
     return _ref_dequantize_int8_simple(q, scale)
 
 
+@compile_op("dequantize_int8_simple_dtype", _meta.int8_dequantize_dtype)
 def dequantize_int8_simple_dtype(
     q: torch.Tensor,
     scale: torch.Tensor,
@@ -810,6 +1098,8 @@ def dequantize_int8_simple_dtype(
     Returns:
         Dequantized tensor in specified dtype.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.dequantize_int8_simple_dtype(q, scale, out_dtype)
     native = _get_native()
     if native is not None and hasattr(native, "dequantize_int8_simple_dtype"):
         _dtype_to_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
@@ -821,6 +1111,7 @@ def dequantize_int8_simple_dtype(
     return _ref_dequantize_int8_simple_dtype(q, scale, out_dtype)
 
 
+@compile_op("mm_int8", _meta.int8_mm)
 def mm_int8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -836,12 +1127,15 @@ def mm_int8(
     Returns:
         INT32 tensor [M, N] with accumulated dot products.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.mm_int8(a, b)
     native = _get_native()
     if native is not None and hasattr(native, "mm_int8"):
         return native.mm_int8(a, b)
     return _ref_mm_int8(a, b)
 
 
+@compile_op("int8_linear", fake_int8_linear)
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -872,6 +1166,8 @@ def int8_linear(
     Returns:
         Result tensor [..., N] in out_dtype.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.int8_linear(x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize, input_act)
     if out_dtype is None:
         out_dtype = x.dtype
     width = 2 if input_act == "swiglu" else 1
@@ -1027,6 +1323,20 @@ def int8_linear(
                 bias,
                 dtype_code,
             )
+        if _can_use_dg2_convrot_fused(
+            x, native, convrot, convrot_groupsize
+        ):
+            x_int8, x_scale = _apply_dg2_convrot_fused(
+                x, native, convrot_groupsize
+            )
+            return native.int8_linear_prequantized(
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            )
         # Rotate through the native cached Hadamard-matrix implementation.
         if convrot:
             if x.shape[-1] % convrot_groupsize != 0:
@@ -1041,6 +1351,16 @@ def int8_linear(
 
                 h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
                 x = _rotate_activation(x, h, convrot_groupsize)
+        if _can_tile_int8_linear(x, native, weight, out_dtype):
+            return _tile_int8_linear(
+                x,
+                native,
+                weight,
+                weight_scale,
+                bias,
+                out_dtype,
+                dtype_code,
+            )
         return native.int8_linear(
             x, weight, weight_scale, bias, dtype_code, False, convrot_groupsize
         )
@@ -1052,6 +1372,7 @@ def int8_linear(
     )
 
 
+@compile_op("int8_linear_prequantized", fake_prequantized)
 def int8_linear_prequantized(
     x_int8: torch.Tensor,
     x_scale: torch.Tensor,
@@ -1077,6 +1398,8 @@ def int8_linear_prequantized(
     Returns:
         Result tensor [..., N] in out_dtype.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.int8_linear_prequantized(x_int8, x_scale, weight, weight_scale, bias, out_dtype)
     dtype_code = {
         torch.float32: 0,
         torch.float16: 1,
@@ -1110,6 +1433,7 @@ def int8_linear_prequantized(
     )
 
 
+@compile_op("int8_linear_shared_input", fake_shared_input)
 def int8_linear_shared_input(
     x: torch.Tensor,
     weight1: torch.Tensor,
@@ -1127,6 +1451,8 @@ def int8_linear_shared_input(
     ConvRot, when requested, is also applied once and therefore must be shared
     by both weights.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.int8_linear_shared_input(x, weight1, weight_scale1, weight2, weight_scale2, bias1, bias2, out_dtype, convrot, convrot_groupsize)
     _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
     if out_dtype is None:
@@ -1207,11 +1533,14 @@ def int8_linear_shared_input(
     )
 
 
+@compile_op("rotate_convrot", fake_rotate_convrot)
 def rotate_convrot(
     x: torch.Tensor,
     group_size: int = 256,
 ) -> torch.Tensor:
     """Apply the online groupwise Hadamard activation rotation."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.rotate_convrot(x, group_size)
     if x.shape[-1] % group_size != 0:
         raise ValueError(
             f"features {x.shape[-1]} not divisible by group_size {group_size}"
@@ -1226,6 +1555,36 @@ def rotate_convrot(
     return _rotate_activation(x, h, group_size)
 
 
+@compile_op("quantize_int8_convrot_fused", _meta.convrot_quantize)
+def quantize_int8_convrot_fused(
+    x: torch.Tensor,
+    group_size: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse ConvRot rotation with rowwise INT8 quantization (DG2/A770).
+
+    The native DG2 route replaces the cached Hadamard matmul with a radix-4
+    SLM butterfly and never materializes the floating rotated activation.
+    Supported contracts: XPU, 2D bf16/f16, K <= 14336, group 64/256.
+    Other inputs raise ``RuntimeError``; callers keep the rotate+quantize
+    fallback.
+    """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.quantize_int8_convrot_fused(x, group_size)
+    native = _get_native()
+    if native is not None and hasattr(
+        native, "quantize_int8_convrot_fused_esimd"
+    ):
+        return native.quantize_int8_convrot_fused_esimd(x, group_size)
+    if native is not None and hasattr(
+        native, "quantize_int8_convrot_fused_dg2"
+    ):
+        return native.quantize_int8_convrot_fused_dg2(x, group_size)
+    raise RuntimeError(
+        "DG2 fused ConvRot quantization is unavailable in this build"
+    )
+
+
+@compile_op("quantize_int8_convrot_weight", _meta.convrot_quantize)
 def quantize_int8_convrot_weight(
     weight: torch.Tensor,
     group_size: int = 256,
@@ -1241,6 +1600,8 @@ def quantize_int8_convrot_weight(
     Returns:
         Tuple of (rotated_quantized_weight_int8, per_row_scales).
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.quantize_int8_convrot_weight(weight, group_size, stochastic_rounding)
     if weight.shape[-1] % group_size != 0:
         raise ValueError(
             f"input features {weight.shape[-1]} not divisible by group_size {group_size}"
@@ -1253,6 +1614,7 @@ def quantize_int8_convrot_weight(
     return _ref_quantize_int8_convrot_weight(weight, group_size, stochastic_rounding)
 
 
+@compile_op("dequantize_int8_convrot_weight", _meta.convrot_dequantize)
 def dequantize_int8_convrot_weight(
     q: torch.Tensor,
     scale: torch.Tensor,
@@ -1268,10 +1630,37 @@ def dequantize_int8_convrot_weight(
     Returns:
         Dequantized weight tensor in float32.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.dequantize_int8_convrot_weight(q, scale, group_size)
     native = _get_native()
     if native is not None and hasattr(native, "dequantize_int8_convrot_weight"):
         return native.dequantize_int8_convrot_weight(q, scale, group_size)
     return _ref_dequantize_int8_convrot_weight(q, scale, group_size)
+
+
+@compile_op("dequantize_int8_convrot_weight_dtype", _meta.convrot_dequantize_dtype)
+def dequantize_int8_convrot_weight_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Inverse ConvRot in FP32, rounding once into the requested output dtype.
+
+    The DG2 native implementation fuses INT8 dequantization, the radix-4
+    inverse rotation, and the final cast for rowwise scales and groups 64/256.
+    """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.dequantize_int8_convrot_weight_dtype(
+            q, scale, group_size, out_dtype)
+    dtype_codes = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
+    if out_dtype not in dtype_codes:
+        raise ValueError("ConvRot output must be float32, float16, or bfloat16")
+    native = _get_native()
+    if native is not None and hasattr(native, "dequantize_int8_convrot_weight_dtype"):
+        return native.dequantize_int8_convrot_weight_dtype(
+            q, scale, group_size, dtype_codes[out_dtype])
+    return _ref_dequantize_int8_convrot_weight(q, scale, group_size).to(out_dtype)
 
 
 def int8_cache_clear() -> None:
@@ -1306,8 +1695,10 @@ __all__ = [
     "int8_linear_prequantized",
     "int8_linear_shared_input",
     "rotate_convrot",
+    "quantize_int8_convrot_fused",
     "quantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight",
+    "dequantize_int8_convrot_weight_dtype",
     "int8_cache_clear",
     "int8_cache_stats",
 ]

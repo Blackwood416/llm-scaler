@@ -16,13 +16,239 @@ Windows wheel tag: cp313-cp313-win_amd64
 llm-scaler source: b9b0c4c900f1a1ef3ec987fe6be5aef26b22e3c8
 ```
 
+A770 兼容 profile 另行验证了以下组合：
+
+```text
+Python 3.13 / PyTorch 2.13.0+xpu
+Intel oneAPI DPC++/C++ Compiler 2026.1.0
+oneDNN 3.11.2 native API/runtime（由 Windows wheel 内置）
+Intel Arc A770 / DG2-G10，驱动 32.0.101.8860
+OMNI_XPU_DEVICE=a770（规范化为 dg2）
+Windows wheel: omni_xpu_kernel-0.2.0b1+torch213.dg2-cp313-cp313-win_amd64.whl
+upstream base: ce0ccb928b1aa59f019a8c27b54fbb82d01c332c
+```
+
+### A770/DG2 SDP 现状
+
+DG2 wheel 从 `omni_xpu_kernel` 0.2.0b1 起打包 `lgrf_sdp` sidecar，使用
+DG2 原生 ESIMD kernel（`flash.attn.b.mha.dg2.h`），A770 上需显式设置
+`OMNI_ATTN_BACKEND=esimd` 启用；默认仍走 PyTorch SDPA。
+
+#### 已保留的负面结果与根因
+
+- Xe2 原版 lgrf kernel 的 `dpas.hf.hf.8.8`（fp16 S×V 累加器）被 DG2 VISA
+  校验器拒绝；改为 fp32 累加器后仍会
+  `UR_RESULT_ERROR_DEVICE_LOST`。
+- 根因（通过独立 SYCL harness + Windows LiveKernelEvent 141 日志确认）：
+  **ESIMD work-group 大小 512 会在 A770（驱动 32.0.101.8860）触发 GPU
+  TDR**，即使 kernel 只做 `slm_init` + 一次 store。Xe2 kernel 家族虽然
+  WG=16，但同时使用 2D LSC、约 17 KB spill 与 fp16 DPAS 累加，同样不稳。
+- 结论：A770 上 ESIMD attention 必须使用小 work-group（当前实现 WG=32，
+  每线程一个 query row，全 head-dim 走寄存器），并避免 2D LSC 与
+  named barrier。
+
+#### 当前验收范围
+
+- 正确性：`B=1, H=1..8, D∈{64,128}, fp16/bf16`，含 q/kv 非 32 倍数与
+  1 token 边界，全部通过（fp16 max_abs ≤ 2.4e-4，bf16 ≤ 2e-3，对照
+  Torch SDPA）。
+- 稳定性：连续调用确定性一致；回归门禁
+  `tests/repro_a770_sdp_device_lost.py` 通过（有限输出 + 误差阈值）。
+- 性能（A770, driver 32.0.101.8860, oneAPI 2026.1, wall median,
+  D=128, fp16, H=32）：v4.1 DPAS 变体
+  （`flash.attn.b.mha.dg2.dpas4.h`）在扩展形状上反超 Torch SDPA。
+  非 fused 路径先把 Q 打包成 DPAS A 操作数布局（每 QK 操作数一个 256B
+  块），RPT=8 达到 100% XMX 行且无 spill；小形状保留 fused RPT=4/BN=64
+  单 kernel；宿主传原始 kv_len，padding 由行号掩码处理，不再写 kvZero。
+  40 样本交错结果：L=512 0.54 vs 0.60 ms，L=2048 2.75 vs 3.29 ms，
+  L=4096 8.8 vs 12.6 ms，L=8192 34.7 vs 41.4 ms；1024x4096 2.91 vs
+  3.20 ms、1024x1024 H48 1.43 vs 1.49 ms、512x512 H48 0.64 vs 0.65 ms。
+  D64 仍走 v1 FMA。
+- 已记录的负面结果（同一驱动/编译器栈）：RPT=6/8 只要有编译器 spill
+  就触发 `UR_RESULT_ERROR_DEVICE_LOST`；RPT=6/BN=128 编译无 spill 但实机
+  DEVICE_LOST；WG=64 的非 fused attn 单 tile 输出错误；fused BN=128 数值
+  错误、fused RPT=6 在 BN=64/32 均 spill；N=8 下 fp16 DPAS 累加被
+  dpas.hpp 拒绝；packedV 不经 SLM 直接读全局比 SLM staging 慢约 60%。
+
+#### H3 INT8 长序列 offload 诊断（2026-08-12）
+
+#### DG2 ConvRot 融合状态（2026-08-15）
+
+#### DG2 D64 attention v4 移植状态（2026-08-16）
+
+`flash.attn.b.mha.dg2.dpas4.d64.h` 是 D128 v4.1 的 D64 移植（生成脚本
+`scripts/gen_dg2_d64_header.py` + 两处语义修复）：
+
+- 修复：K pack 的 chunk 映射（D128 每 lane 2 chunk → D64 每 lane 1
+  chunk）、非融合 packed-Q A 操作数按 RPT 存储、RPT=8（满 XMX 行）。
+- 正确性：fp16/bf16 D64（H=32）全 seq 1..20683 通过，fp16 max_abs
+  ≤1.5e-3，bf16 ≤1.6e-2；无 DEVICE_LOST（含 20x 压力）。
+- 性能：仍然输给 torch SDPA（L=4096/8192/20683 为 0.84-0.92x，L=1797
+  为 0.57x）。因此 ComfyUI-OmniXPU 的 `dg2_torch_d64_fp16` fallback
+  gate 保留；kernel 保留供其他目标/驱动升级后复测。
+- 已记录的负面结果：debug 构建下非融合路径对 `qState=nullptr` 解引用
+  （dump 代码让 qChunkAll 保持存活）会 DEVICE_LOST；release 构建无此问题。
+
+`int8_convrot_quant_dg2.cpp`（SLM 版）与 `int8_convrot_quant_esimd.cpp`
+（寄存器版）共同替代 `rotate_convrot` 的缓存 Hadamard matmul，并融合
+rowwise INT8 量化：
+
+- 最终采用：寄存器版 ESIMD 蝶形（PTL-H 设计，DG2 上实测
+  `20685x14336` 约 4.3ms vs matmul+quantize 约 7.3ms，1.7x 加速；
+  bf16 约 93% 与 matmul 路径逐元素一致，其余相差 ≤1 个 INT8 LSB，
+  scale 偏差 ≤0.4%；50 次 TDR 敏感形状压力无 DEVICE_LOST）。
+- 路由：`OMNIXPU_DG2_CONVROT_FUSED=1` 默认开启（A/B 时设 0），
+  `int8_linear`/H3 streaming 路径优先走
+  `quantize_int8_convrot_fused_esimd`，SLM 版保留为后备。
+- 已记录的负面结果：SLM 版（三 kernel，WG=256/每 subgroup 一组）在
+  DG2 上只有 ~80GB/s，17ms 级别慢于生产路径；无效 subgroup 在 barrier
+  前提前 return 会 DEVICE_LOST（已修复为 clamp+mask）；蝶形后的原地
+  bf16 round pass 会被 DPC++ 折叠掉（移除 round、把 1/sqrt(G) 折叠进
+  scale/quant_inv）。独立复现保留在
+  `benchmarks/dg2_convrot_standalone.cpp` 与
+  `tests/test_int8_convrot_fused_dg2.py`。
+
+#### H3 INT8 长序列 offload 诊断（2026-08-12）
+
+`comfy-info8.log` 的两次完整 workflow（int8_convrot 权重、内置 UNet
+Loader）单次约 559-569 s。前 200 个 `seq=20683/head=56/D=128` block 占
+约 440 s；后续 3780 个 `seq=1797/head=32/D=64` block 仅约 90-100 s。
+
+- 已打点的 `int8_linear (20683,5376)x(28672,5376)` 实测只有约 35 ms
+  （oneDNN `jit:gemm:any`，sync-each wall median），但 ComfyUI 日志中该
+  事件到下一个 RMSNorm 的间隔约 0.85 s。慢的部分不在 OmniXPU kernel。
+- 同一 block 的 `fc2`（SwiGLU + 14336 宽线性）没有 `int8_linear` kernel
+  日志：vbar/offload cast 把 TensorWise INT8 权重反量化成 bf16，然后走
+  bf16 `F.linear`。离线复算该回退约 41 ms（反量化 8.5 ms + SwiGLU/bf16
+  linear 40.6 ms），仍远小于 0.85 s，剩余时间来自 vbar page-in/transfer。
+- A/B 建议：`OMNIXPU_INT8_DIRECT_CAST=1` 时，offloaded TensorWise INT8
+  模块直接拷 qdata/scale 上 XPU 并返回设备端 `QuantizedTensor`，绕过
+  bf16 反量化（vbar 与普通 lowvram 均适用）。qdata 搬运实测约 8-27 ms
+  （36-110 MiB），int8 kernel
+  13-36 ms，合计约 20-60 ms/offloaded projection。
+- 复现探针：`benchmarks/dg2_int8_phase0_probe.py`（真实 H3 phase-0 形状：
+  qkv/fc1/fc2/out + CPU 搬运）。
+
+#### H3 主循环瓶颈归属（comfy-info14，AIMDO draft PR 生效后）
+
+`comfy-info14.log` 连跑两次完整 workflow：`314.73 s` / `259.84 s`，H3
+主模型阶段（`seq=20683`，200 block）两次均为约 160 s，VAE 阶段约 92-120 s。
+相比 `comfy-info8/13`（H3 约 440-495 s）是 AIMDO draft PR
+（`pr-windows-usm-free-hang`：保留原生 XPU allocator、Level Zero tracing、
+VBAR 边界预回收 + active VBAR 保护）带来的，不是 OmniXPU kernel 改动。
+
+`benchmarks/h3_main_phase_a770.py`（真实 H3 shape、sync-each）实测：
+
+- attention `(1,20683,56,128) bf16`：omni ESIMD v4 `405-410 ms`
+  （约 30 TFLOPS，接近 A770 bf16 峰值）；torch SDPA `431-451 ms`。
+  adapter 的 `BHLD->permute+contiguous->BLHD` 三份拷贝实测被隐藏
+  （406 vs 408 ms），不是 0.51 s 间隔的来源。
+- int8 oneDNN（tensorwise 真实量化权重）：qkv `29-35 ms`、fc1 `38-46 ms`、
+  out `13-15 ms`、fc2(SwiGLU+convrot) `33 ms`；torch bf16 反量化线性
+  分别约 `48-62 / 64-84 / 17-22 ms`。
+- RMSNorm `(20683,5376) bf16`：`1.4 ms`。
+- 完整 block（rms+qkv+attn+out+rms+fc1+fc2）串行实测 `556 ms/block`，
+  即纯 kernel 部分约 `111 s / 200 block`。日志阶段 160 s，差额约
+  `245 ms/block`（约 49 s/run）来自 `mixed_precision.Linear` 的
+  dispatch 开销：`QuantizedTensor.from_float` 先把激活量化，再经 torch
+  dispatch 反量化回 bf16，随后我们的 kernel 重新 rowwise 量化；
+  qkv/out/fc1 每次约 90-96 ms（dispatch->kernel 间隔）。
+
+- fc2 在无 LoRA/offload 状态下实际走 `linear_input_act` 的 registry
+  XPU 路径（`comfy_kitchen.backends.xpu.int8_linear` -> omni int8），
+  因此没有 `int8_linear` kernel 调试日志；日志缺失不代表 bf16 回退。
+  之前 info8 记录的 fc2 bf16 回退属于 vbar/offload/LoRA 状态。
+
+对应修复：`ComfyUI-OmniXPU/adapters/fp8_gemm.py` 的
+`mixed_precision.Linear` 增加 INT8 快路径——满足
+（XPU + `int8_tensorwise` + TensorWiseINT8Layout + 无 LoRA function +
+ 权重已驻留 XPU + 无 pre_quant_scale/input_scale）时直接调用
+`omni_int8.int8_linear`，跳过 from_float/dequant/dispatch 往返。
+数值路径与 `linear_input_act` 的 fc2 一致；其余条件一律回退原逻辑。
+调试日志标记 `backend=omni_dg2_compat_fast`。可用
+`OMNIXPU_INT8_FAST_FORWARD=0` 关闭快路径做 A/B。
+
+实测（info17）快路径首次未生效的原因：H3 权重在 vbar 下驻留 CPU，
+`self.weight.device != input.device` 导致跳过；真实工作流里 qkv/out/fc1/fc2
+四个 Linear 的权重都在 CPU，按需 stream 进 GPU。因此快路径增加
+`OMNIXPU_INT8_FAST_FORWARD_COPY=1`（默认开）兜底：qdata/scale 不在
+XPU 时先 `.to(device)` 再跑同一个 omni kernel（与原路径每调用搬运的数据量
+相同，但跳过 from_float/dequant/dispatch）。设
+`OMNIXPU_INT8_FAST_FORWARD_COPY=0` 恢复严格 device 条件。
+
+info18（copy=on）A/B：H3 主模型阶段约快 10 s（attention 间隔
+0.746→0.694 s），但 VAE 明显变慢（int8_linear 链间隔 22→40 ms）：VAE
+权重在 CPU，每次调用多一次 H2D 拷贝（4-33 MiB），而 VAE kernel 只有
+1-3 ms，拷贝开销反而占主导。修复：拷贝兜底只在大激活时启用
+（`OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS`，默认 16 Mi 元素，约
+32 MiB bf16），VAE 小 Linear 回退原路径；权重已在 XPU 时不受限。
+
+info19（阈值生效）：H3 三个 Linear 全部 `omni_dg2_compat_fast`，VAE
+回到原路径，总时长 301.26 s / 254.06 s（info17 为 310.96 / 257.56）。
+
+info20（PR #4 + 新版 ComfyUI + D64→torch）：255.02 s / 220.79 s，无
+DEVICE_LOST。VAE attention 全部 `dg2_torch_d64_fp16`；H3 主模型
+int8 全部 `omni_dg2_compat_fast`。
+
+#### 工作流级 profiling 结论（2026-08-13，headless 复现 224.6/190.5 s）
+
+自跑链路：`benchmarks/run_h3_workflow.ps1`（comfy-cli + 种子随机化，
+可 `-Verbose` / `-NoManager`）、`benchmarks/profile_h3_workflow.ps1`
+（py-spy 采样）、`benchmarks/vtune_h3_workflow.ps1`（VTune + 工作流）。
+
+- VTune gpu-hotspots：attention kernel 81.4 s、oneDNN GEMM 12.8 s、
+  其他 42.5 s；GPU 占用 75.9%。H2D 传输 151.8 GB 主要来自 VAE 逐 tile
+  的权重搬运（约 3780 tile × 4 Linear），不是 H3。
+- py-spy：`_int8_qdata_cached` 的高采样是首轮 200 个模块一次性 H2D
+  拷贝（这也解释了第二次运行快 ~20 s）；真正的 host 时间分散在 torch
+  dispatch（~38%）、cast_bias_weight 机制、asyncio/manager，没有单一
+  可下手热点。
+- A/B 均无收益并回退/未采用：VAE 小 Linear 快路径（首跑 297 s）、
+  norm cast 绕过（权重在 CPU 时不生效）、norm 参数缓存、关 manager、
+  wrapper→native 直连。qdata 缓存本身确认无 churn、命中正常。
+- 每 block ~680 ms vs standalone GPU 下限 ~537 ms，剩余 ~140 ms 是
+  ComfyUI/torch 调度与同步间隙，属架构固有；attention kernel 366 ms
+  已贴峰值。当前实际可用成绩：首跑 ~214-225 s、第二次 ~182-192 s。
+
+#### VTune：H3 attention 已贴峰值（2026-08-13）
+
+`benchmarks/dg2v4_h3_vtune_driver.cpp`（bf16、L=KV=20683、H=56、D=128，
+直接调 sidecar `sdp_bf16io`）实测纯 kernel 366 ms（约 33.5 TFLOPS）；
+VTune gpu-hotspots 显示 attn 占 99.4% GPU 指令、packK 0.5%、packQ 0.08%。
+kernel 侧没有可挖空间。工作流内每 block ~0.7-0.8 s 的剩余来自 host 侧：
+每个 block 重复 H2D 拷贝 qkv/out/fc1/fc2 的 qdata（约 386 MiB）。
+`OMNIXPU_INT8_QDATA_CACHE=1`（默认开）按模块身份+存储身份缓存 XPU
+qdata/scale 副本（LRU，上限 12），消除重复拷贝；权重原地变更会失效，
+LoRA 路径（weight_function 非空）本就不走快路径。可用
+`OMNIXPU_INT8_QDATA_CACHE=0` 关闭 A/B。
+
+info21（qdata cache 默认开）：首跑 254 s / 217 s，与 info20 基本持平；
+逐事件时间线显示每 block ~840 ms，其中 GPU 计算下限约 537 ms
+（standalone 真实权重全 block 流水线实测），剩余 ~240 ms/block 是
+ComfyUI host/VRAM 开销（vbar cast、run_every_op、rope/qnorm、日志等），
+不是 kernel。fc2 原本仍走 `linear_input_act` 的 cast_bias_weight +
+registry int8（每 block 重复 77 MiB 拷贝 + vbar page-in），现也纳入
+快路径：`comfy.ops.linear_input_act` 被补丁接管，TensorWise INT8 +
+swiglu + 大激活时直接走 cached-qdata omni kernel
+（debug 标记 `omni_dg2_compat_fast_fc2`）。
+
+#### DG2 D64 attention 实测回归（2026-08-13）
+
+同步测出 DG2 的 ESIMD D64 kernel 远慢于 torch SDPA：
+`(1,1797,32,64) fp16` 10.57 ms vs 1.22 ms（约 8.7x）；`(1,20683,32,64)`
+1.45 s vs 0.10 s（约 14x）。该 D64 sidecar 路径继承自 Xe2 调优、未在
+A770 重新测量；VAE 阶段约 53 s/run 都耗在这里。适配器新增
+`dg2_torch_d64_fp16` 路由：DG2 + fp16 + D64 + 无 mask 直接走 torch
+SDPA（BHLD 输入零拷贝），预计 VAE 阶段省 ~45-50 s/run。D128 bf16
+主模型保持 ESIMD（385 vs 391 ms，基本持平）。
+
 本文不把 ComfyUI Portable 当作编译环境。编译环境位于项目目录内，
 Portable 只用于最终安装和运行测试，避免修改其他项目的 Python 环境。
 
 > [!IMPORTANT]
 > Torch、Python ABI 和 GPU AOT 目标都属于 wheel 身份的一部分。不同
 > Python ABI、Torch minor 或 GPU 架构必须分别构建，不能通过重命名 wheel
-> 互换。Torch 2.13 尚未包含在本文的已验证范围内。
+> 互换。Torch 2.13 仅在上述 Windows DG2/A770 组合中完成验证。
 
 ## 1. 已验证版本矩阵
 
@@ -65,6 +291,8 @@ NuGet fallback。
 `dnnl.dll`。构建仍然需要同一个 oneAPI oneDNN development install 中的
 `oneapi/dnnl/dnnl.hpp`、`dnnl.lib` 和 `dnnl.dll`。`setup.py` 会校验三者对应
 oneDNN `3.9.1`，并把 DLL 和 redistribution notices 打进 Windows wheel。
+Windows Torch 2.13 DG2 profile 使用同一 SYCL 2026 ABI 的 oneDNN `3.11.2`；
+不要给该组合混入依赖 `sycl8.dll` 的 2025.3 oneDNN runtime。
 
 Torch XPU 在本次解析出的关键原生传递依赖如下。通常不应逐项手工安装，
 而应让 `torch==2.12.0+xpu` 解析它们：
@@ -311,6 +539,12 @@ if not exist "%BUILD_ROOT%\wheelhouse\patched" mkdir "%BUILD_ROOT%\wheelhouse\pa
   --no-deps
 ```
 
+`setup.py` 会把 Windows 核心扩展的多个 translation unit 并行编译。默认
+最多 8 个并行任务；需要手动控制时设置 `OMNI_XPU_BUILD_JOBS`（或
+`MAX_JOBS`），例如 `set OMNI_XPU_BUILD_JOBS=8` 后再执行 `pip wheel`。
+实测 DG2/Torch 2.13 全量 wheel 构建约 4-5 分钟，并行开关不会改变产物
+身份。
+
 `--no-build-isolation` 是必需的：构建必须读取当前 venv 中已安装的
 Torch XPU 头文件、库和版本。`--no-deps` 避免打包过程改变环境。
 
@@ -328,7 +562,7 @@ size:   25,185,658 bytes
 SHA256: E112C1720ACA4AF975501470A77F654656D6A4A3CF919A36A2EFBC8B1F4F0795
 ```
 
-体积增加来自 wheel 内置的 oneDNN `3.9.1` Windows runtime。构建只复制与
+体积增加来自 wheel 内置的匹配 oneDNN Windows runtime。构建只复制与
 已校验 `dnnl.lib` 同一个安装根下的 `bin\dnnl.dll`，不会把 Torch、SYCL、
 Unified Runtime 或完整 oneAPI SDK 重复打进 wheel。
 
@@ -585,6 +819,37 @@ Windows wheel 使用 ABI 后缀，例如
 4. `omni_xpu_kernel\.libs\dnnl.dll`、`python_embeded\Library\bin` 和
    `torch\lib` 是否可见；
 5. 测试 cwd 是否离开源码 checkout。
+
+#### SeedVR2 A770 优化与负面结果（2026-08-19/20）
+
+目标：`seedvr2_3b_int8_upscale_video.json`（输入 124 帧 1280x2304，3B
+INT8 ConvRot 模型，A770 / torch 2.13 / oneAPI 2026.1 / driver 8860）。
+
+实测端到端：**681 s → 607 s**（decode 415→362 s，encode 162→146 s，
+sampling 82→78 s）。
+
+- DG2 启用 SeedVR2 cat-pad（`[1,128,4,512,512]` temporal-major + 连续
+  prefix）与 SeedVR group-norm（`[4,128,512,512]` temporal-interleaved）：
+  standalone 分别 7.2 vs 9.3 ms、2.95 vs 5.4 ms（vs torch），输出与
+  torch 一致（cat-pad 逐位一致，group-norm 在 fp16 噪声内）。
+- Attention dispatch：A770 D128 bf16/fp16 在 `q_len∈[1024,2048)∪
+  (2048,4096)` 区间 esimd 比 torch SDPA 慢 1.1-1.6x，`q_len==2048` 与
+  `q_len>=4096` 才占优；插件按此回退 torch。
+
+已记录的负面结果：
+
+- **单次 USM 分配上限约 4 GiB**（3.9 GiB 成功、4.0 GiB 失败，即使空闲
+  14+ GiB）；`UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` 可解除（4.0 /
+  4.12 / 5.27 / 8.0 GiB 均成功）。未设置时 SeedVR2 decode 的 4.12 GiB
+  fp32 结果会 OOM，ComfyUI-OmniXPU 提供 CPU staging fallback。
+- VTune（attach decode 300 s）：GPU Time 99.7%，XVE Array
+  Stalled/Idle 68.1% —— decode 是 GPU 满负荷、conv3d 访存/占用受限，
+  host 不是瓶颈；oneDNN 仍是该形状的最强 conv 基线。
+- spatial tile 512→1024：decode 峰值内存超过 16 GiB，直接 OOM。
+- temporal_size 64→125（外层 3→2 chunk）：decode 365 vs 362 s，无收益
+  —— 总帧数决定成本，外层 chunk 数不是瓶颈。
+- INT8 fast-path copy 阈值 16Mi→4Mi：中型 int8 linear 接入快路径但
+  采样无提升（77 vs 78 s），默认阈值保持 16Mi。
 
 ## 10. Torch 2.13 后续阶段
 

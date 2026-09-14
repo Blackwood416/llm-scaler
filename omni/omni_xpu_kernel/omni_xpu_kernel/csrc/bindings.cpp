@@ -17,6 +17,12 @@
 #include "utils.h"
 
 namespace omni_xpu {
+namespace layout {
+#if defined(OMNI_XPU_ARCH_BMG) || defined(OMNI_XPU_ARCH_DG2)
+    torch::Tensor cat_pad_bmg(
+        torch::Tensor prefix, torch::Tensor input, int64_t spatial_pad);
+#endif
+}
 namespace gguf {
     torch::Tensor dequantize_q4_0(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_1(const torch::Tensor& input, torch::ScalarType dtype);
@@ -32,6 +38,11 @@ namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
 #if defined(OMNI_XPU_ARCH_BMG)
     torch::Tensor group_norm_bmg(
+        torch::Tensor input, int64_t groups, torch::Tensor weight,
+        torch::Tensor bias, double eps);
+#endif
+#if defined(OMNI_XPU_ARCH_BMG) || defined(OMNI_XPU_ARCH_DG2)
+    torch::Tensor group_norm_seedvr_bmg(
         torch::Tensor input, int64_t groups, torch::Tensor weight,
         torch::Tensor bias, double eps);
 #endif
@@ -52,9 +63,17 @@ namespace svdq {
     torch::Tensor unpack_svdq_int4(const torch::Tensor& packed, bool is_signed);
     std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_int4(const torch::Tensor& input, int64_t group_size);
     std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_uint4(const torch::Tensor& input, int64_t group_size);
+    std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_s8(const torch::Tensor& input, int64_t group_size);
     torch::Tensor onednn_int4_gemm(const torch::Tensor& act, const torch::Tensor& packed, const torch::Tensor& wscales);
     torch::Tensor onednn_int4_gemm_preconverted(const torch::Tensor& act, const torch::Tensor& packed_u4, const torch::Tensor& scales_f16);
+    torch::Tensor onednn_int4_gemm_torchao(
+        const torch::Tensor& act, const torch::Tensor& packed_u4,
+        const torch::Tensor& zp_u8, const torch::Tensor& scales_f16);
     void onednn_int4_gemm_add_to_output(const torch::Tensor& act, const torch::Tensor& packed_u4, const torch::Tensor& scales_f16, torch::Tensor& dst);
+    torch::Tensor onednn_s8u4_gemm(
+        const torch::Tensor& act, const torch::Tensor& xscales,
+        const torch::Tensor& packed_u4, const torch::Tensor& scales_f16,
+        torch::ScalarType out_dtype, std::optional<torch::Tensor> zp_u8);
     void fused_convert_add(torch::Tensor& out, const torch::Tensor& result, const torch::Tensor& residual);
     torch::Tensor fused_smooth_convert(const torch::Tensor& x, const torch::Tensor& smooth_factor);
     torch::Tensor fused_smooth_mul_convert(const torch::Tensor& x, const torch::Tensor& rcp_smooth);
@@ -84,6 +103,8 @@ namespace rotary {
 }
 namespace sdp {
     torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+    torch::Tensor sdp_bhld(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+    void clear_cache();
 }
 namespace linear {
     torch::Tensor onednn_w8a16_fp8(torch::Tensor input, torch::Tensor weight, torch::Tensor scale_w, std::optional<torch::Tensor> bias);
@@ -130,6 +151,10 @@ namespace int8_ops {
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
         torch::Tensor input);
 #endif
+    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused_dg2(
+        torch::Tensor input, int64_t group_size);
+    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused(
+        torch::Tensor input, int64_t group_size);
     torch::Tensor fused_silu_mul(torch::Tensor x1, torch::Tensor x2);
     torch::Tensor fused_silu_mul_exact_bf16(
         torch::Tensor gate, torch::Tensor up);
@@ -144,6 +169,9 @@ namespace int8_ops {
         torch::Tensor weight, int64_t group_size, int64_t stochastic_rounding);
     torch::Tensor dequantize_int8_convrot_weight(
         torch::Tensor q, torch::Tensor scale, int64_t group_size);
+    torch::Tensor dequantize_int8_convrot_weight_dtype(
+        torch::Tensor q, torch::Tensor scale, int64_t group_size,
+        int64_t output_dtype_code);
     torch::Tensor fused_scaleback(torch::Tensor gemm_result, torch::Tensor x_scale,
                                   torch::Tensor w_scale, std::optional<torch::Tensor> bias,
                                   int64_t out_dtype_code);
@@ -211,6 +239,8 @@ PYBIND11_MODULE(_C, m) {
     m.attr("__core_aot_target__") = "ptl-h";
 #elif defined(OMNI_XPU_CORE_AOT) && defined(OMNI_XPU_ARCH_BMG)
     m.attr("__core_aot_target__") = "bmg";
+#elif defined(OMNI_XPU_CORE_AOT) && defined(OMNI_XPU_ARCH_DG2)
+    m.attr("__core_aot_target__") = "dg2";
 #else
     m.attr("__core_aot_target__") = "";
 #endif
@@ -269,6 +299,19 @@ PYBIND11_MODULE(_C, m) {
             return result;
         },
         py::arg("index") = 0);
+
+    auto layout = m.def_submodule(
+        "layout", "Validated layout and materialization fusions");
+#if defined(OMNI_XPU_ARCH_BMG) || defined(OMNI_XPU_ARCH_DG2)
+    layout.attr("__cat_pad_bmg__") = true;
+    layout.def(
+        "cat_pad_bmg",
+        &omni_xpu::layout::cat_pad_bmg,
+        "BMG temporal-prefix concatenation and symmetric spatial zero-pad",
+        py::arg("prefix"), py::arg("input"), py::arg("spatial_pad") = 1);
+#else
+    layout.attr("__cat_pad_bmg__") = false;
+#endif
     
     // GGUF Dequantization
     auto gguf = m.def_submodule("gguf", "GGUF dequantization kernels");
@@ -324,6 +367,17 @@ PYBIND11_MODULE(_C, m) {
         py::arg("bias"), py::arg("eps") = 1e-6);
 #else
     norm.attr("__group_norm_bmg__") = false;
+#endif
+#if defined(OMNI_XPU_ARCH_BMG) || defined(OMNI_XPU_ARCH_DG2)
+    norm.attr("__group_norm_seedvr_bmg__") = true;
+    norm.def(
+        "group_norm_seedvr_bmg",
+        &omni_xpu::norm::group_norm_seedvr_bmg,
+        "BMG GroupNorm for validated SeedVR2 temporal-interleaved activations",
+        py::arg("input"), py::arg("groups"), py::arg("weight"),
+        py::arg("bias"), py::arg("eps") = 1e-6);
+#else
+    norm.attr("__group_norm_seedvr_bmg__") = false;
 #endif
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
@@ -385,6 +439,11 @@ PYBIND11_MODULE(_C, m) {
     svdq.def("quantize_svdq_act_uint4", &omni_xpu::svdq::quantize_svdq_act_uint4,
         "Quantize non-negative activation to unsigned U4 [0, 15]",
         py::arg("input"), py::arg("group_size") = 64);
+    svdq.def("quantize_svdq_act_s8", &omni_xpu::svdq::quantize_svdq_act_s8,
+        "Quantize activation to symmetric S8 with per-group absmax scaling\n"
+        "Input: [M, K] fp16/bf16\n"
+        "Output: (act_s8 [M, K] int8, scales [M, G] f32)",
+        py::arg("input"), py::arg("group_size") = 64);
 
     svdq.def("onednn_int4_gemm", &omni_xpu::svdq::onednn_int4_gemm,
         "Fused INT4 dequant + GEMM using oneDNN u4 matmul primitive\n"
@@ -399,6 +458,25 @@ PYBIND11_MODULE(_C, m) {
         "Input: act [M, K] bf16/f16/f32, packed_u4 [N, K/2] uint8, scales_f16 [G, N] f16\n"
         "Output: [M, N] same dtype as act",
         py::arg("act"), py::arg("packed_u4"), py::arg("scales_f16"));
+
+    svdq.def("onednn_int4_gemm_torchao", &omni_xpu::svdq::onednn_int4_gemm_torchao,
+        "torchao-format INT4 native (asymmetric): unsigned u4 weights + "
+        "per-block zero points + per-block f16 scales, "
+        "w = (q - zp) * scale inside oneDNN.\n"
+        "Asymmetric per-block zero point keeps biased weight distributions "
+        "centered, reducing quantization error vs symmetric INT4.\n"
+        "Input: act [M, K] bf16/f16/f32, packed_u4 [N, K/2] uint8 (raw qdata "
+        "byte view, NO xor), zp_u8 [G, N] uint8, scales_f16 [G, N] f16\n"
+        "Output: [M, N] same dtype as act",
+        py::arg("act"), py::arg("packed_u4"), py::arg("zp_u8"), py::arg("scales_f16"));
+
+    svdq.def("onednn_s8u4_gemm", &omni_xpu::svdq::onednn_s8u4_gemm,
+        "W4A8 GEMM: s8 act x u4 packed weights via oneDNN. zp_u8=None 走标量 "
+        "zp=8（wa4）；zp_u8=[G_wei, N] 走 per-block zp（tint4/torchao 非对称，"
+        "w=(q-zp)*scale 在 oneDNN 内完成）",
+        py::arg("act"), py::arg("xscales"), py::arg("packed_u4"),
+        py::arg("scales_f16"), py::arg("out_dtype") = torch::kBFloat16,
+        py::arg("zp_u8") = py::none());
 
     svdq.def("onednn_int4_gemm_add_to_output", &omni_xpu::svdq::onednn_int4_gemm_add_to_output,
         "Fused INT4 GEMM + accumulate into bf16 output using oneDNN append_sum post-op\n"
@@ -513,6 +591,15 @@ PYBIND11_MODULE(_C, m) {
         "Returns: (output, has_nonfinite) where has_nonfinite is True if kernel\n"
         "detected inf/nan (e.g. degenerate softmax), signaling SDPA fallback needed.",
         py::arg("q"), py::arg("k"), py::arg("v"));
+    sdp.def("sdp_bhld", &omni_xpu::sdp::sdp_bhld,
+        "DG2 BHLD-direct Flash Attention (no permute+copy)\n"
+        "Input: q/k/v [B=1, H, L, D] fp16/bf16 contiguous on XPU, D == 128\n"
+        "Returns: [B, L, H, D] output (BLHD) for copy-free reshape to BLD.",
+        py::arg("q"), py::arg("k"), py::arg("v"));
+    sdp.def("clear_cache", &omni_xpu::sdp::clear_cache,
+        "Release sidecar-owned packed Q/K/V USM buffers. ComfyUI model "
+        "management cannot free these; call before starting a new workflow "
+        "run when VRAM pressure is observed.");
 
     // INT8 Quantization and Linear (oneDNN s8 matmul)
     auto int8 = m.def_submodule("int8", "INT8 quantization and linear kernels");
@@ -621,6 +708,18 @@ PYBIND11_MODULE(_C, m) {
     int8.def("rotate_convrot", &omni_xpu::int8_ops::rotate_convrot,
         "Regular Hadamard rotation using a cached matrix multiplication on the last dimension",
         py::arg("input"), py::arg("group_size") = 256);
+    int8.def(
+        "quantize_int8_convrot_fused_dg2",
+        &omni_xpu::int8_ops::quantize_int8_convrot_fused_dg2,
+        "DG2 fused ConvRot activation rotation + rowwise INT8 quantization "
+        "(radix-4 SLM butterfly, K <= 14336, group sizes 64/256)",
+        py::arg("input"), py::arg("group_size") = 256);
+    int8.def(
+        "quantize_int8_convrot_fused_esimd",
+        &omni_xpu::int8_ops::quantize_int8_convrot_fused,
+        "Register-based ESIMD fused ConvRot activation rotation + rowwise "
+        "INT8 quantization (PTL-H design; DG2 measurement in progress)",
+        py::arg("input"), py::arg("group_size") = 256);
     int8.def("quantize_int8_convrot_weight", &omni_xpu::int8_ops::quantize_int8_convrot_weight,
         "Native ConvRot weight rotation followed by row-wise INT8 quantization",
         py::arg("weight"), py::arg("group_size") = 256,
@@ -628,6 +727,10 @@ PYBIND11_MODULE(_C, m) {
     int8.def("dequantize_int8_convrot_weight", &omni_xpu::int8_ops::dequantize_int8_convrot_weight,
         "Dequantize INT8 ConvRot weight and apply the inverse orthogonal rotation",
         py::arg("q"), py::arg("scale"), py::arg("group_size") = 256);
+    int8.def("dequantize_int8_convrot_weight_dtype", &omni_xpu::int8_ops::dequantize_int8_convrot_weight_dtype,
+        "Dequantize and inverse-rotate INT8 weights with a requested output dtype",
+        py::arg("q"), py::arg("scale"), py::arg("group_size") = 256,
+        py::arg("output_dtype_code") = 2);
     int8.def("fused_scaleback", &omni_xpu::int8_ops::fused_scaleback,
         "ESIMD fused scale-back: int32 GEMM result → output dtype in single pass.\n"
         "Fuses: int32→f32 cast + scale multiply + dtype conversion + bias add.\n"
