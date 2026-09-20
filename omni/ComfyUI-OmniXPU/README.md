@@ -130,8 +130,8 @@ OMNIXPU_MEDIAN_STRICT_INDICES=1
 ```
 
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` reproduces the exact tie-break indices. The
-median workaround was only verified on BMG with Torch 2.10 and remains
-disabled by default on other configurations.
+median workaround was only verified on BMG with Torch 2.10 and must not be
+enabled by default on PTL-H or another Torch version.
 
 `OMNIXPU_INT8_DIRECT_CAST=1` is an A770-only experiment for partially
 offloaded INT8 models. ComfyUI's offload cast path can dequantize a
@@ -146,6 +146,96 @@ reuse the cached patched bf16 weight instead of recomputing the LoRA every
 step. This is separate (`OMNIXPU_INT8_PATCH_CACHE=1`) because early
 measurements showed it can regress under VRAM pressure; leave it off unless
 you are A/B testing that specific cache.
+
+## Adapter behavior
+
+Attention uses explicit capability guards. `auto` selects CUTE routes for
+matching platform, Torch-version, dtype, layout, and operator contracts, and
+uses the original PyTorch attention path for every remaining contract. It
+never selects ESIMD. `cute` and `esimd` are explicit diagnostic policies;
+unsupported contracts still fall back safely.
+
+On Windows, an unset `OMNI_ATTN_BACKEND` defaults to `torch`, leaving ComfyUI's
+PyTorch SDPA route unpatched. ESIMD remains available as an explicit diagnostic
+or performance opt-in with `OMNI_ATTN_BACKEND=esimd`; it is never selected
+automatically.
+
+On BMG with Torch 2.11, the experimental LTX-style BF16 D128 route accepts
+dense B2/H32 self-attention and B1/B2/H32 KV1024 cross-attention inputs as
+`[B,L,H*D]` tensors or dense BHLD views. The adapter makes the BHLD view
+without a layout copy. B2 self-attention uses CUTE from sequence length 768,
+and B1/B2 cross-attention uses it from query length 1024 when KV length is
+1024. There is no generation-size-derived upper limit: larger lengths are
+selected from the public kernel capability instead of an exact traced shape.
+
+The first use logs a warning with the global rollback setting. If the native
+operation raises for a contract, that call falls back to PyTorch and the
+contract is quarantined for the rest of the process. Set
+`OMNI_ATTN_BACKEND=torch` before ComfyUI startup to disable the experimental
+route globally.
+
+The norm adapter preserves ComfyUI cast/offload hooks and uses native kernels
+only for eligible tensors. PTL-H H120 and non-contiguous split-QKV routes also
+require native feature markers, preventing a stale wheel from taking them.
+
+The FP8 adapter is temporary ComfyUI integration around model/factory paths
+that are not completely expressed as Kitchen operations. Generic FP8 tensor
+quantization and dequantization remain Kitchen-owned.
+
+The fused INT8 FFN adapter wires eligible Lumina/Z-Image `FeedForward` blocks
+to Kitchen/native primitives. It does not register `comfy_kitchen::int8_linear`
+and does not replace a model pipeline. LoRA, offloaded weights, bias, training,
+unsupported layouts, and unsupported shapes retain ComfyUI's original route.
+
+## torch.compile on A770
+
+The kernel wheel ships Dynamo dispatch boundaries (`omni_xpu_kernel._compile_ops`,
+`torch.ops.omni_xpu.*`) so the native kernels are opaque custom operators inside
+a compiled graph. Without them Dynamo cannot trace a quantized checkpoint.
+
+Enable it in a workflow with ComfyUI's own `TorchCompileModel` node
+(`backend=inductor`) between the model loader and the sampler. Two requirements:
+
+- Inductor needs a C++ compiler on `PATH`; start ComfyUI from a shell that has
+  run `...\VC\Auxiliary\Build\vcvars64.bat`, otherwise compilation fails with
+  `InvalidCxxCompiler: Compiler: cl is not found`.
+- Point `TORCHINDUCTOR_CACHE_DIR` at a stable directory. The default on Windows
+  is `%TEMP%\torchinductor_<user>`, which system cleanup can remove.
+
+While tracing, the adapter defers to ComfyUI's own quantized dispatch and skips
+the eager fp8 / int8 fast paths: those paths specialise on every weight shape
+(one graph per layer until Dynamo hits its per-code recompile limit and falls
+back to eager), and keeping them out of the graph with a graph break trips
+Dynamo's `transformer_options` resume path (`KeyError: 'total_blocks'` on
+Krea2). Eager execution is unchanged.
+
+Measured on Arc A770, Krea2 turbo int8 convrot with the fp8 text encoder
+(768x1280, 8 steps):
+
+| scenario | eager | torch.compile (inductor) |
+|---|---|---|
+| first run, empty cache | 30.8 s | 195 s (compile) |
+| restart, disk cache present | 30.8 s | 43.7 s |
+| in-process second run | 21.7 s | 17.9 s |
+
+The compile cost is paid once per graph and shape; it pays off when a session
+runs many images at the same resolution, not for one-off generations.
+
+### Compiled models bypass AIMDO's dynamic VRAM
+
+ComfyUI's `TorchCompileModel` clones the patcher with `disable_dynamic=True`
+because a compiled graph captures weight addresses once; weights cannot be
+paged or re-cast per call afterwards. The compiled model is therefore loaded
+statically (`Model <name> prepared for dynamic VRAM loading` never appears for
+it in the log) while everything else in the process keeps using AIMDO's
+dynamic VRAM path.
+
+That is a trade-off, not a bug: compile only helps models that fit in VRAM as
+a resident copy. On a 16 GB A770, a 12.8 GB INT8 DiT can be compiled (the text
+encoder stays dynamic), while a 32 GB H3 checkpoint cannot and must keep using
+AIMDO's dynamic VM. Upstream's runtime bootstrap states the same limitation in
+one line: `AIMDO memory compiler is not yet supported on XPU; DynamicVRAM
+model-weight offloading is available. This does not disable torch.compile.`
 
 ## Debugging and diagnostics
 
@@ -184,6 +274,7 @@ Kitchen backend ownership can be inspected independently:
 ```bash
 python -c 'import comfy_kitchen as ck; print(ck.list_backends()["xpu"])'
 ```
+
 The INT8 fast forward uses ComfyUI's `cast_bias_weight` / `uncast_bias_weight`
 pair, including Dynamic VRAM residency and low-VRAM LoRA patches. It avoids
 the redundant activation quantize/dequantize round trip, without keeping a
@@ -224,7 +315,7 @@ Measured end-to-end on A770 (`seedvr2_3b_int8_upscale_video.json`):
 the former `OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS` below 16 Mi did not
 speed up sampling. Those copy controls have since been removed.
 
-## What belongs upstream
+## Contribution boundary
 
 New device-generic math, layouts, quantization, or fallback logic belongs in
 `comfy_kitchen`. A custom-node adapter is appropriate only when a ComfyUI class
