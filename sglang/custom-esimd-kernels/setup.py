@@ -10,6 +10,15 @@ root = Path(__file__).parent.resolve()
 
 import torch
 torch_include = str(Path(torch.__file__).parent / "include")
+dnnl_component_root = Path(
+    os.environ.get("DNNLROOT", "/opt/intel/oneapi/dnnl/2025.3")
+)
+dnnl_root = Path(
+    os.environ.get(
+        "DNNL_ROOT",
+        dnnl_component_root.parents[1] / dnnl_component_root.name,
+    )
+)
 
 ext_modules = [
     SyclExtension(
@@ -146,6 +155,68 @@ ext_modules.append(
     )
 )
 ### Eagle kernels
+
+### Speculative sampling (temperature > 0) — tree walk half of the CUDA
+### TreeSpeculativeSamplingTargetOnly. Kept as its own small extension so it
+### rebuilds in seconds instead of recompiling the 100KB eagle.sycl.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_sglang.spec_sampling_ops",
+        sources=[
+            "csrc/eagle/spec_sampling.sycl",
+        ],
+        include_dirs=[
+            root / "csrc" / "eagle",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++20"],
+            "sycl": ["-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Speculative sampling
+
+### oneDNN W8A16 prefill GEMM
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_sglang.onednn_w8a16",
+        sources=[
+            "csrc/xpu/onednn_w8a16/bindings.cpp",
+            "csrc/xpu/onednn_w8a16/onednn_runtime.cpp",
+        ],
+        include_dirs=[
+            root / "csrc" / "xpu" / "onednn_w8a16",
+            dnnl_root / "include",
+        ],
+        library_dirs=[str(dnnl_root / "lib")],
+        libraries=["dnnl"],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": [
+                "-O3",
+                "-fsycl",
+                "-ffast-math",
+                "-fsycl-device-code-split=per_kernel",
+                "-fsycl-targets=spir64_gen",
+                "-Xs",
+                "-device bmg",
+                f"-I{torch_include}",
+            ],
+        },
+        extra_link_args=[
+            "-fsycl",
+            f"-L{dnnl_root / 'lib'}",
+            "-ldnnl",
+            f"-Wl,-rpath,{dnnl_root / 'lib'}",
+            "-Wl,-rpath,$ORIGIN/../../torch/lib",
+        ],
+        py_limited_api=False,
+    )
+)
+### oneDNN W8A16 prefill GEMM
 
 ### Grouped GGUF MoE GGEMV (Q4_K up + Q5_K/Q6_K down, doubleGRF DPAS).
 # Used by sglang gguf.py for GGUF MoE prefill + MTP-verify (small-M N=16 occupancy
@@ -353,7 +424,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg -options -doubleGRF",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],

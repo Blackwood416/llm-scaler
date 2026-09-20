@@ -58,7 +58,7 @@ at::Tensor esimd_qkv_split_norm_rope(
     at::Tensor norm_wq, at::Tensor norm_wk,
     at::Tensor positions,
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
-    int64_t rotary_dim, at::Tensor cos_sin_cache);
+    int64_t rotary_dim, at::Tensor cos_sin_cache, bool normalize_v);
 
 // Fused Conv1d + GDN for Qwen3-Next-80B-A3B decode — reads from projections directly
 // qkvz:               [N, qkvz_dim] fp16 — projected_states_qkvz, read-only
@@ -124,6 +124,7 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    at::Tensor new_residual,
     double eps);
 
 // Fused RMSNormGated + FP8 GEMV for GDN out_proj decode path
@@ -231,6 +232,42 @@ at::Tensor esimd_gemv_q8_0(
     at::Tensor output);
 
 // M-tiled q8_0 dense GEMV (small M, MTP verify): input [M,K], output [M,N].
+void esimd_norm_gemv_q8_0(
+    at::Tensor x, at::Tensor z, at::Tensor nw, at::Tensor y,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    int64_t HV, int64_t V, double eps);
+
+void esimd_resadd_norm_gemv_q8_ba(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor xn, at::Tensor nr,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1);
+
+// Fused (resadd + GemmaRMSNorm) + q4_K / q6_K / fp16 GEMVs, single launch.
+void esimd_resadd_norm_gemv_kq(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor nr, at::Tensor xn,
+    at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn,
+    at::Tensor o4, int64_t of4,
+    at::Tensor q6_ql, at::Tensor q6_qh, at::Tensor q6_sc,
+    at::Tensor o6, int64_t of6,
+    at::Tensor w_ba, at::Tensor o_ba);
+
+void esimd_resadd_norm_gemv_q4k_silu(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor nr, at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn,
+    at::Tensor y);
+
+void esimd_norm_add_norm_gemv_q4k_gelu(
+    at::Tensor h, at::Tensor residual, at::Tensor nr,
+    at::Tensor w1, at::Tensor w2, double eps1, double eps2,
+    at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn, at::Tensor y);
+
+void esimd_norm_gemv_q5k(
+    at::Tensor x, at::Tensor z, at::Tensor nw,
+    at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor y, int64_t V, double eps);
+
 at::Tensor esimd_gemv_q8_0_m(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
@@ -242,9 +279,51 @@ at::Tensor esimd_gemv_q4_k(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor weight_min, at::Tensor output);
 
+// M-tiled q4_K GEMV (small M: MTP verify, or decode at batch>1).
+// input [M,K], output [M,N]. Reads the q4_K weights once per row-tile.
+at::Tensor esimd_gemv_q4_k_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor weight_min, at::Tensor output);
+
+// Canonical GGUF IQ4_NL/IQ4_XS GEMV: packed LUT indices [N,K/2] and final
+// scale [N,K/32]. Both raw GGUF formats are normalized before this interface.
+at::Tensor esimd_gemv_iq4(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
+at::Tensor esimd_gemv_iq4_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
+// Canonical GGUF Q3_K GEMV: packed low-2 bits [N,K/4], subtract mask
+// [N,K/8], and final per-16-element scale [N,K/16].
+at::Tensor esimd_gemv_q3_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output);
+
+at::Tensor esimd_gemv_q3_k_m(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output);
+
+// Canonical GGUF IQ3_S GEMV: qs [N,K/4], qh [N,K/32], signs [N,K/8],
+// and final per-32-element scale [N,K/32].
+at::Tensor esimd_gemv_iq3_s(
+    at::Tensor input, at::Tensor qs, at::Tensor qh, at::Tensor signs,
+    at::Tensor weight_scale, at::Tensor output);
+
+at::Tensor esimd_gemv_iq3_s_m(
+    at::Tensor input, at::Tensor qs, at::Tensor qh, at::Tensor signs,
+    at::Tensor weight_scale, at::Tensor output);
+
 // GGUF q5_K GEMV: PACKED (ql nibble [N,K/2] + pre-shuffled 1-bit qh [N,K/8]),
 // asymmetric scale+min [N,K/32]. dequant v5=nibble|(qh<<4); w=scale*v5-min.
 at::Tensor esimd_gemv_q5_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output);
+
+// M-tiled q5_K GEMV (small M: MTP verify, or decode at batch>1).
+// input [M,K], output [M,N]. Reads the q5_K weights once per row-tile.
+at::Tensor esimd_gemv_q5_k_m(
     at::Tensor input, at::Tensor ql, at::Tensor qh,
     at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output);
 
@@ -264,17 +343,53 @@ at::Tensor esimd_moe_up_q4k(
     at::Tensor x, at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
     at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
     at::Tensor sel, at::Tensor inter,
-    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k,
+    int64_t act);
 
 // Fused GGUF k-quant MoE down, PACKED -> per-route weighted partial.
 at::Tensor esimd_moe_down_q5k(
     at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k,
+    bool add_min);
+at::Tensor esimd_moe_down_q8(
+    at::Tensor inter, at::Tensor qs, at::Tensor sc,
     at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
     int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
 at::Tensor esimd_moe_down_q6k(
     at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc,
     at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
     int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+
+// Fused GGUF Q8_0 shared-expert MLP (gate_up + silu + down + gate*sigmoid).
+at::Tensor esimd_shared_expert_q8(
+    at::Tensor x, at::Tensor gu_qs, at::Tensor gu_sc,
+    at::Tensor d_qs, at::Tensor d_sc, at::Tensor wg, int64_t inter_s);
+
+// Fused GGUF FULL MoE (decode): topk + routed + shared -> one op.
+at::Tensor esimd_moe_forward_full_gguf(
+    at::Tensor x, at::Tensor logits,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm);
+
+// Norm-fused variant: absorbs the post-attention GemmaRMSNorm (residual add +
+// RMS norm, `norm_w` = 1 + gemma weight) and the fp16 router GEMV into the MoE
+// op. `residual` is updated in place; returns {moe_out, residual}.
+std::vector<at::Tensor> esimd_moe_forward_full_gguf_norm(
+    at::Tensor h, at::Tensor residual, at::Tensor norm_w, double eps,
+    at::Tensor router_w,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm);
 
 // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
 at::Tensor esimd_gemm_q4_0(
@@ -293,6 +408,43 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+at::Tensor esimd_gemv_fp16(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+void esimd_norm_gemv_norm_fp16(
+    at::Tensor residual, at::Tensor scale_with_root,
+    at::Tensor proj_weight, at::Tensor pre_ff_weight,
+    at::Tensor router_logits, at::Tensor moe_input, double eps);
+void esimd_norm_add_norm_gemv_gelu_fp8(
+    at::Tensor attention_output, at::Tensor residual_input,
+    at::Tensor post_attention_weight, at::Tensor pre_feedforward_weight,
+    at::Tensor gate_up_weight, at::Tensor gate_up_scale,
+    at::Tensor residual_output, at::Tensor activation_output,
+    double post_attention_eps, double pre_feedforward_eps);
+void esimd_rmsnorm_gemv_fp8(
+    at::Tensor input, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale,
+    at::Tensor output, double eps);
+void esimd_dual_rmsnorm_residual_scalar(
+    at::Tensor x1, at::Tensor weight1,
+    at::Tensor x2, at::Tensor weight2,
+    at::Tensor weight3, at::Tensor residual,
+    at::Tensor output, double eps1, double eps2,
+    double eps3, double scalar);
+void esimd_norm_add_norm(
+    at::Tensor h2_raw, at::Tensor h1, at::Tensor w1, at::Tensor w2,
+    at::Tensor out, double eps1, double eps2);
+void esimd_kv_scatter(
+    at::Tensor k, at::Tensor v, at::Tensor k_cache, at::Tensor v_cache,
+    at::Tensor indices);
+void xpu_create_kv_indices(
+    at::Tensor req_to_token, at::Tensor req_pool_indices,
+    at::Tensor page_kernel_lens, at::Tensor kv_indptr,
+    at::Tensor kv_start_idx, at::Tensor kv_indices,
+    int64_t max_len, bool has_start);
+at::Tensor esimd_rmsnorm_residual_scalar(
+    at::Tensor x, at::Tensor weight, at::Tensor residual, at::Tensor output,
+    double eps, double scalar);
 
 // ============================================================================
 // FP8/INT4 GEMM (v2, from custom-esimd-kernels-vllm) — used by the gemm ext.

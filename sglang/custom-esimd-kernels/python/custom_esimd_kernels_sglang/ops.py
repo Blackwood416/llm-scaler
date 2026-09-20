@@ -202,6 +202,85 @@ def esimd_gemv_q4_k(
     return _ops.esimd_gemv_q4_k(input, weight, weight_scale, weight_min, output)
 
 
+def esimd_gemv_q4_k_m(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    weight_min: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled GGUF q4_K GEMV (small M: MTP verify, or plain decode at batch>1).
+
+    Same layout as esimd_gemv_q4_k, but reads the q4_K weights ONCE per row-tile
+    and multiplies against all M activation rows — vs the generic M>1 path that
+    dequantizes the whole matrix to a 4x-bigger fp16 table on every call (the
+    dequant cost is independent of M, so it dominates already at M=2).
+
+    input [M,K] fp16 (row-major); output [M,N] fp16.
+    N=weight.size(0), K=weight.size(1)*2. K not a multiple of 512 falls back to
+    M separate M=1 GEMVs (still no fp16 dequant round-trip).
+    """
+    return _ops.esimd_gemv_q4_k_m(input, weight, weight_scale, weight_min, output)
+
+
+def esimd_gemv_iq4(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical IQ4_NL/IQ4_XS GEMV for decode (M=1).
+
+    ``weight`` is [N,K/2] packed LUT indices (low nibble is element 2j), and
+    ``weight_scale`` is the final FP16 scale [N,K/32]. The raw GGUF format has
+    already been normalized, so both IQ4 variants use this operation.
+    """
+    return _ops.esimd_gemv_iq4(input, weight, weight_scale, output)
+
+
+def esimd_gemv_iq4_m(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical IQ4_NL/IQ4_XS GEMV for M>=1."""
+    return _ops.esimd_gemv_iq4_m(input, weight, weight_scale, output)
+
+
+def esimd_gemv_q3_k(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical Q3_K GEMV for decode (M=1)."""
+    return _ops.esimd_gemv_q3_k(input, ql, qh, weight_scale, output)
+
+
+def esimd_gemv_q3_k_m(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical Q3_K GEMV for M>=1."""
+    return _ops.esimd_gemv_q3_k_m(input, ql, qh, weight_scale, output)
+
+
+def esimd_gemv_iq3_s(
+    input: torch.Tensor, qs: torch.Tensor, qh: torch.Tensor,
+    signs: torch.Tensor, weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical IQ3_S GEMV for decode (M=1).
+
+    ``qs`` is the low eight bits of each 9-bit grid index [N,K/4]; ``qh``
+    stores the high bits LSB-first [N,K/32], and ``signs`` stores one
+    LSB-first sign bit per value [N,K/8]. ``weight_scale`` is the final FP16
+    per-32-element scale [N,K/32].
+    """
+    return _ops.esimd_gemv_iq3_s(input, qs, qh, signs, weight_scale, output)
+
+
+def esimd_gemv_iq3_s_m(
+    input: torch.Tensor, qs: torch.Tensor, qh: torch.Tensor,
+    signs: torch.Tensor, weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical IQ3_S GEMV for M>=1."""
+    return _ops.esimd_gemv_iq3_s_m(
+        input, qs, qh, signs, weight_scale, output
+    )
+
+
 def esimd_gemv_q5_k(
     input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
     weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,
@@ -216,6 +295,22 @@ def esimd_gemv_q5_k(
     input [1,K] fp16; output [1,N] fp16. N=ql.size(0), K=ql.size(1)*2 (mult 512).
     """
     return _ops.esimd_gemv_q5_k(input, ql, qh, weight_scale, weight_min, output)
+
+
+def esimd_gemv_q5_k_m(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled GGUF q5_K GEMV (small M: MTP verify, or plain decode at batch>1).
+
+    Same PACKED layout as esimd_gemv_q5_k, but reads the q5_K weights ONCE per
+    row-tile and multiplies against all M activation rows — vs the generic M>1
+    path that dequantizes to a 3.2x-bigger fp16 table on every call.
+
+    input [M,K] fp16 (row-major); output [M,N] fp16. N=ql.size(0),
+    K=ql.size(1)*2 (multiple of 512).
+    """
+    return _ops.esimd_gemv_q5_k_m(input, ql, qh, weight_scale, weight_min, output)
 
 
 def esimd_gemv_q6_k(
@@ -249,24 +344,25 @@ def esimd_gemv_q6_k_m(
 
 def esimd_moe_up_q4k(
     x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
-    n_tokens, hidden, intermediate, top_k,
+    n_tokens, hidden, intermediate, top_k, act: int = 0,
 ):
     """Fused GGUF k-quant MoE up/gate stage (Q4_K gate + Q4_K up).
 
     One launch over all routed (token,expert) pairs: dequant gate+up (Q4_K
-    interleaved nibble, per-32 scale+min), silu(gate)*up -> inter.
+    interleaved nibble, per-32 scale+min), act(gate)*up -> inter.
+    act: 0 = SiLU (default), 1 = GELU tanh ("gelu_pytorch_tanh", gemma-4).
     gate_ql/up_ql [E,inter,hidden/2] u8; gate_sc/mn,up_sc/mn [E,inter,hidden/32]
     fp16; sel [n_routed] int32; inter [n_routed, intermediate] fp16 (out).
     """
     return _ops.esimd_moe_up_q4k(
         x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
-        n_tokens, hidden, intermediate, top_k,
+        n_tokens, hidden, intermediate, top_k, act,
     )
 
 
 def esimd_moe_down_q5k(
     inter, ql, qh, sc, mn, sel, topk_w, out_partial,
-    n_tokens, hidden, intermediate, top_k,
+    n_tokens, hidden, intermediate, top_k, add_min: bool = False,
 ):
     """Fused GGUF Q5_K MoE down stage, PACKED (zero extra memory).
 
@@ -274,9 +370,28 @@ def esimd_moe_down_q5k(
     (ql nibble + pre-shuffled 1-bit qh + per-32 scale+min) . dot(inter) * topk_w
     -> per-route partial out_partial [n_routed, hidden] (host sums top_k).
     ql [E,hidden,inter/2] u8; qh [E,hidden,inter/8] u8; sc/mn [E,hidden,inter/32].
+
+    add_min selects the offset sign: False = Q5_K (w = v*scale - min), True =
+    legacy Q5_1 (w = v*d + m), which the host repacks into this same layout.
     """
     return _ops.esimd_moe_down_q5k(
         inter, ql, qh, sc, mn, sel, topk_w, out_partial,
+        n_tokens, hidden, intermediate, top_k, add_min,
+    )
+
+
+def esimd_moe_down_q8(
+    inter, qs, sc, sel, topk_w, out_partial,
+    n_tokens, hidden, intermediate, top_k,
+):
+    """Fused GGUF Q8_0 MoE down stage (symmetric: w = scale * qs).
+
+    Same contract as esimd_moe_down_q5k but for the legacy Q8_0 down tensors a
+    Q4_K_M mix can leave behind. qs [E,hidden,inter] int8; sc [E,hidden,inter/32]
+    fp16; out_partial [n_routed, hidden] fp16 (host sums over top_k).
+    """
+    return _ops.esimd_moe_down_q8(
+        inter, qs, sc, sel, topk_w, out_partial,
         n_tokens, hidden, intermediate, top_k,
     )
 
@@ -351,6 +466,7 @@ def esimd_qkv_split_norm_rope(
     attn_output_gate: bool,
     rotary_dim: int = 256,
     cos_sin_cache: torch.Tensor = None,
+    normalize_v: bool = False,
 ) -> torch.Tensor:
     """Fused QKV Split + RMSNorm(weight+1.0, eps=1e-6) + RoPE.
 
@@ -364,12 +480,15 @@ def esimd_qkv_split_norm_rope(
     rotary_dim:    number of dimensions to apply RoPE.
     cos_sin_cache: [max_pos, rotary_dim] fp16 — from rotary_emb.cos_sin_cache.
                    Layout: [cos(rotary_dim/2), sin(rotary_dim/2)] per row.
+    normalize_v:   apply a weight-free RMSNorm to the V branch (gemma-4);
+                   False keeps the Qwen3 plain-copy behaviour.
     headDim=256 only.
     """
     return _ops.esimd_qkv_split_norm_rope(
         qkv_state, q_out, gate_out, k_out, v_out,
         norm_wq, norm_wk, positions,
-        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
+        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache,
+        normalize_v)
 
 
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
@@ -531,16 +650,19 @@ def esimd_resadd_norm_gemv2_fp8_pert(
     norm_weight: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
     w1: torch.Tensor, s1: torch.Tensor, o1: torch.Tensor,
+    new_residual: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
     """Fused ResidualAdd + RMSNorm + 2-matrix FP8 GEMV.
 
     For input_layernorm + GDN in_proj (qkvz + ba projections).
-    residual updated in-place. o0/o1 are output buffers.
+    o0/o1 are output buffers. ``new_residual`` is written with
+    ``hidden + residual`` (fp16) by the kernel, removing the separate
+    aten::add dispatch on the caller side.
     """
     return _ops.esimd_resadd_norm_gemv2_fp8_pert(
         hidden_states, residual, norm_weight,
-        w0, s0, o0, w1, s1, o1, eps)
+        w0, s0, o0, w1, s1, o1, new_residual, eps)
 
 
 def esimd_norm_gemv_fp8_pert(
@@ -1082,6 +1204,56 @@ def moe_forward_full(
         shared_down_weight, shared_down_scale,
         shared_expert_gate_weight,
         top_k, num_shared_experts, n_routed_experts)
+
+
+def moe_forward_full_gelu_tanh_routed(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Gemma4 routed MoE for E4M3 or E5M2 per-expert FP8 weights."""
+    return _moe_batch.moe_forward_full_gelu_tanh_routed(
+        x,
+        topk_weights,
+        topk_indices,
+        gate_up_weight,
+        gate_up_scale,
+        down_weight,
+        down_scale,
+        top_k,
+        n_routed_experts,
+    )
+
+
+def moe_forward_full_gelu_tanh_decode(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Gemma4 TP=2 decode from router logits for E4M3 or E5M2 weights."""
+    return _moe_batch.moe_forward_full_gelu_tanh_decode(
+        x,
+        logits,
+        gate_up_weight,
+        gate_up_scale,
+        down_weight,
+        down_scale,
+        per_expert_scale,
+        top_k,
+        n_routed_experts,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1674,6 +1846,31 @@ def moe_prefill_full_fp8(
         w13, w13_scale, w2, w2_scale, top_k, num_experts)
 
 
+def moe_prefill_full_fp8_gelu_tanh(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Gemma4 M-tiled FP8 MoE prefill for E4M3 or E5M2 weights."""
+    return _moe_fp8_prefill.moe_prefill_full_fp8_gelu_tanh(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        top_k,
+        num_experts,
+    )
+
+
 # Decode SDPA for sglang's flat NHD KV-cache layout. Exposed as a pybind11
 # method on the compiled extension module (not a torch.ops op).
 def _load_attn_mod():
@@ -1704,3 +1901,193 @@ def sglang_decode_attn_temp_size(batches: int, num_q_heads: int, max_seq_len: in
     n_splits = max((max_seq_len + SPLIT_TILE - 1) // SPLIT_TILE, 1)
     per_partial = batches * num_q_heads * n_splits
     return per_partial * (1 + 1 + 256)
+
+
+def esimd_gemv_fp16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    return _ops.esimd_gemv_fp16(input, weight, output)
+
+
+def esimd_norm_gemv_norm_fp16(
+    residual: torch.Tensor,
+    scale_with_root: torch.Tensor,
+    proj_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    router_logits: torch.Tensor,
+    moe_input: torch.Tensor,
+    eps: float,
+) -> None:
+    _ops.esimd_norm_gemv_norm_fp16(
+        residual,
+        scale_with_root,
+        proj_weight,
+        pre_ff_weight,
+        router_logits,
+        moe_input,
+        eps,
+    )
+
+
+def esimd_norm_add_norm_gemv_gelu_fp8(
+    attention_output: torch.Tensor,
+    residual_input: torch.Tensor,
+    post_attention_weight: torch.Tensor,
+    pre_feedforward_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    residual_output: torch.Tensor,
+    activation_output: torch.Tensor,
+    post_attention_eps: float,
+    pre_feedforward_eps: float,
+) -> None:
+    _ops.esimd_norm_add_norm_gemv_gelu_fp8(
+        attention_output,
+        residual_input,
+        post_attention_weight,
+        pre_feedforward_weight,
+        gate_up_weight,
+        gate_up_scale,
+        residual_output,
+        activation_output,
+        post_attention_eps,
+        pre_feedforward_eps,
+    )
+
+
+def esimd_rmsnorm_gemv_fp8(
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gemv_weight: torch.Tensor,
+    gemv_scale: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+) -> None:
+    _ops.esimd_rmsnorm_gemv_fp8(
+        input,
+        norm_weight,
+        gemv_weight,
+        gemv_scale,
+        output,
+        eps,
+    )
+
+
+def esimd_dual_rmsnorm_residual_scalar(
+    x1: torch.Tensor,
+    weight1: torch.Tensor,
+    x2: torch.Tensor,
+    weight2: torch.Tensor,
+    weight3: torch.Tensor,
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    eps1: float,
+    eps2: float,
+    eps3: float,
+    scalar: float,
+) -> None:
+    _ops.esimd_dual_rmsnorm_residual_scalar(
+        x1,
+        weight1,
+        x2,
+        weight2,
+        weight3,
+        residual,
+        output,
+        eps1,
+        eps2,
+        eps3,
+        scalar,
+    )
+
+
+def xpu_create_kv_indices(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    page_kernel_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_start_idx: torch.Tensor | None,
+    kv_indices: torch.Tensor,
+    max_len: int,
+) -> None:
+    start = page_kernel_lens if kv_start_idx is None else kv_start_idx
+    _ops.xpu_create_kv_indices(
+        req_to_token,
+        req_pool_indices,
+        page_kernel_lens,
+        kv_indptr,
+        start,
+        kv_indices,
+        max_len,
+        kv_start_idx is not None,
+    )
+
+
+def esimd_norm_add_norm(
+    h2_raw: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    eps1: float,
+    eps2: float,
+) -> None:
+    _ops.esimd_norm_add_norm(h2_raw, h1, w1, w2, out, eps1, eps2)
+
+
+def esimd_kv_scatter(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    _ops.esimd_kv_scatter(k, v, k_cache, v_cache, indices)
+
+
+def esimd_rmsnorm_residual_scalar(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> torch.Tensor:
+    return _ops.esimd_rmsnorm_residual_scalar(
+        x, weight, residual, output, eps, scalar
+    )
+
+
+def onednn_fp8_gemm_w8a16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return _ops.onednn_fp8_gemm_w8a16(input, weight, weight_scale, bias)
+
+
+def splitk_decode_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    scratch: torch.Tensor,
+    max_seq_len: int,
+    num_splits: int,
+) -> None:
+    _eagle_ops.splitk_decode_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        out,
+        scratch,
+        max_seq_len,
+        num_splits,
+    )

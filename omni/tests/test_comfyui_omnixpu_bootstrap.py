@@ -7,7 +7,6 @@ import sys
 import types
 from pathlib import Path
 
-
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 
 
@@ -70,10 +69,15 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_ATTENTION",
         "OMNIXPU_ROTARY",
         "OMNIXPU_NORM",
+        "OMNIXPU_H3_RMS_MODULATION",
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
         "OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM",
         "OMNIXPU_LORA_MEMORY",
+        "OMNIXPU_SEEDVR_ADA_RESHAPE",
+        "OMNIXPU_SEEDVR_CAPACITY",
+        "OMNIXPU_SEEDVR_CAT_PAD",
+        "OMNIXPU_LARGE_VIDEO_PREPROCESS",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
     ):
@@ -83,10 +87,17 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.attention
     assert config.rotary
     assert config.norm
+    # A770 fork: the fused H3 norm+modulation route is opt-in (measured ~0.5%
+    # end-to-end on A770 while changing the numeric path), unlike upstream.
+    assert not config.h3_rms_modulation
     assert config.fp8_gemm
     assert config.int8_ffn
     assert config.dynamic_vram_boundary_trim
     assert config.lora_memory
+    assert config.seedvr_ada_reshape
+    assert config.seedvr_capacity
+    assert config.seedvr_cat_pad
+    assert config.large_video_preprocess
     assert not config.interpolate_fix
     assert not config.median_fix
     assert not hasattr(config, "rope")
@@ -98,14 +109,30 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
     patches = _load_registry(monkeypatch)
     cfg = types.SimpleNamespace(
         attention=False,
+        sparse_attention=False,
         rotary=False,
         norm=False,
+        h3_rms_modulation=False,
         fp8_gemm=False,
         int8_ffn=False,
         dynamic_vram_boundary_trim=False,
         lora_memory=False,
+        quantized_matmul=False,
+        seedvr_ada_reshape=False,
+        seedvr_capacity=False,
+        seedvr_cat_pad=False,
+        large_video_preprocess=False,
         interpolate_fix=False,
         median_fix=False,
+        # A770/DG2 fork components.
+        rms_rope=False,
+        int4_gemm=False,
+        seedvr_vae_cpu_stage=False,
+        kitchen_compat=False,
+        int8_native_gate=False,
+        int8_direct_cast=False,
+        sdp_cache_lifecycle=False,
+        sampling_prefetch=False,
     )
     patches.apply_all_patches(cfg)
 

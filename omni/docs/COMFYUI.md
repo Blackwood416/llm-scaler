@@ -6,25 +6,34 @@ bundled in the image.
 ## Start the server
 
 Mount an existing ComfyUI model directory and start ComfyUI directly. This is
-the recommended default when the workflow fits in XPU memory:
+the recommended default when the workflow fits in XPU memory. The following
+uses the local image produced by the source-build command in
+[`../README.md`](../README.md); `0.2.0-b2` is not currently available as a
+published image:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b1
+IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
-    --privileged \
     --device=/dev/dri \
     --network=host \
     --shm-size=64g \
     --name="$CONTAINER_NAME" \
     --workdir=/llm/ComfyUI \
-    -v /path/to/comfyui_models:/llm/ComfyUI/models \
+    -v /path/to/comfyui_models:/models/host:ro \
+    -v /path/to/comfyui_input:/data/input \
+    -v /path/to/comfyui_output:/data/output \
+    -v /path/to/comfyui_user:/data/user \
     "$IMAGE" \
-    python main.py
+    python main.py \
+        --extra-model-paths-config /llm/configs/comfyui_host_models.yaml \
+        --input-directory /data/input \
+        --output-directory /data/output \
+        --user-directory /data/user
 ```
 
-The release image supports Intel Arc B-series/Battlemage GPUs.
+This source-built image supports Intel Arc B-series/Battlemage GPUs.
 
 The default server is available at `http://127.0.0.1:8188`. Append
 `--listen 0.0.0.0` when remote access is required, and append
@@ -47,17 +56,40 @@ OOM failures, but the additional weight-management work can reduce performance
 when the workflow already fits in XPU memory. The reserve can be changed with
 `OMNI_COMFYUI_RESERVE_VRAM_GB` when required by a specific workload.
 
+The Linux provider defaults to `native_hook`. This entrypoint automatically
+preloads its verified library before Python starts, so Torch keeps its native
+XPU caching allocator while AIMDO manages DynamicVRAM weights. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` before the entrypoint to use the Linux
+pluggable allocator instead. A direct Python launch with DynamicVRAM enabled
+must prepare the native preload itself.
+
 Additional ComfyUI arguments are forwarded by the entrypoint. For example:
 
 ```bash
 /llm/entrypoints/start_comfyui.sh --disable-smart-memory
 ```
 
+To keep the entrypoint's model paths, reserve and manager configuration while
+explicitly disabling DynamicVRAM, pass:
+
+```bash
+OMNIXPU_PROVIDER_BOOTSTRAP=auto \
+    /llm/entrypoints/start_comfyui.sh --disable-dynamic-vram
+```
+
+The explicit flag replaces the entrypoint's enable default. Supplying both
+enable and disable flags is rejected. In provider `auto` mode, Kitchen XPU
+routing remains available while AIMDO is skipped for disabled DynamicVRAM;
+provider `required` mode requires both providers and therefore rejects this
+configuration.
+
 ## Models and workflows
 
-Place model files under the standard `/llm/ComfyUI/models` subdirectories used
-by their loader nodes. Use the model's official ComfyUI documentation for the
-exact file names and directory:
+Organize the host directory with the standard ComfyUI model subdirectories and
+mount it read-only at `/models/host`. The supplied
+`/llm/configs/comfyui_host_models.yaml` registers those directories with the
+loader nodes. Use the model's official ComfyUI documentation for the exact
+file names and directory:
 
 - [ComfyUI documentation](https://docs.comfy.org/)
 - [ComfyUI Template Browser](https://docs.comfy.org/interface/features/template)
@@ -85,6 +117,19 @@ The Dockerfile is the source of truth for exact revisions. Installing or
 updating nodes through ComfyUI Manager changes the running container and is
 not part of the reproducible image build.
 
+## Sparse attention
+
+Use the built-in **Model Sparse Attention** node (`BlockSparseAttention`) to
+select SOL, SLA or VSA. Connect it after the model loader and any model LoRA
+or sampling-shift nodes, then pass its model output to the guider/sampler.
+ComfyUI-OmniXPU enables eligible XPU calls through Kitchen and the packaged
+native kernels. See [native sparse attention](SPARSE_ATTENTION.md) for the
+matching weights, parameters, execution checks and legacy-node migration.
+
+The old **Patch Sol-Attn** custom node is deprecated for this integration and
+is no longer installed by the focused image build. Existing workflows must
+be migrated explicitly.
+
 ## Omni XPU switches
 
 ComfyUI-OmniXPU adapters are enabled by default and fall back to the original
@@ -93,21 +138,61 @@ ComfyUI path when a capability or input is unsupported. Common switches are:
 ```bash
 OMNIXPU_ENABLE=0
 OMNIXPU_ATTENTION=0
+OMNIXPU_SPARSE_ATTENTION=0
 OMNIXPU_NORM=0
 OMNIXPU_FP8_GEMM=0
 OMNIXPU_INT8_FFN=0
 ```
+
+Kitchen and AIMDO are installed as their official distributions. Their XPU
+implementations are separately named runtime-provider distributions, activated
+only during the normal ComfyUI custom-node prestartup lifecycle when the
+official version, Torch XPU build, platform, target, and provider integrity all
+match. No launcher change is required:
+
+```bash
+OMNIXPU_PROVIDER_BOOTSTRAP=auto      # use each compatible XPU provider
+OMNIXPU_PROVIDER_BOOTSTRAP=off       # retain the official implementations
+OMNIXPU_PROVIDER_BOOTSTRAP=required  # fail unless both providers activate
+```
+
+Reinstalling or upgrading an official Kitchen or AIMDO distribution does not
+overwrite provider-owned files. If the official version no longer matches the
+installed provider, `auto` mode leaves that provider inactive until its
+matching XPU provider wheel is installed. AIMDO XPU activation additionally
+requires DynamicVRAM; Kitchen routing does not.
+
+The image exports a pip constraint for the Torch/XPU ABI and the provider
+distributions. Upgrade the detached ComfyUI checkout with:
+
+```bash
+bash /llm/tools/update_comfyui.sh
+```
+
+The helper refuses tracked local edits, fetches ComfyUI `master` by default, and
+installs its normal requirements under that runtime constraint. Set
+`COMFYUI_UPGRADE_REF` to an exact commit for a reproducible upgrade. Run such
+changes in a new container or preserve the container explicitly; they do not
+modify the source image.
+
+Do not mount host directories over `/llm/ComfyUI/models`, `input`, or `output`
+when the checkout must remain upgradable. Upstream tracks files below those
+directories; replacing them with bind mounts makes the files appear deleted,
+so the helper correctly rejects the checkout as modified. Mount host models at
+`/models/host:ro`, mount mutable state below `/data`, and use the supplied
+configuration and path arguments as in the startup command above.
 
 See [ComfyUI-OmniXPU](../ComfyUI-OmniXPU/README.md) for adapter behavior,
 diagnostics, and opt-in legacy workarounds.
 
 ## Outputs
 
-Mount `/llm/ComfyUI/output` when generated files must survive container
-removal:
+Mount `/data/output` and select it with `--output-directory` when generated
+files must survive container removal:
 
 ```bash
--v /path/to/comfyui_output:/llm/ComfyUI/output
+-v /path/to/comfyui_output:/data/output
 ```
 
-Input files can similarly be mounted at `/llm/ComfyUI/input`.
+Input files and user state can similarly be mounted at `/data/input` and
+`/data/user`, selected with `--input-directory` and `--user-directory`.
